@@ -32,6 +32,18 @@ contract MEVDetector {
     mapping(bytes32 => uint256) public rollingPriorityFeeAvg;
     mapping(bytes32 => uint256) public priceImpactThreshold;
 
+    struct TradeRecord {
+        bool lastZeroForOne;
+        uint32 lastSwapBlock;
+        bool hasTraded;
+    }
+
+    mapping(bytes32 => mapping(address => TradeRecord)) public tradeHistory;
+    uint32 public reversalWindowBlocks;
+
+    mapping(bytes32 => mapping(address => uint256)) public lastAddLiquidityBlock;
+    uint32 public jitWindowBlocks;
+
     event GovernanceUpdated(address indexed newGovernance);
     event HookUpdated(address indexed newHook);
     event OracleRelayerUpdated(address indexed newRelayer);
@@ -57,6 +69,8 @@ contract MEVDetector {
         governance = _governance;
         hook = _hook;
         oracleRelayer = _oracleRelayer;
+        reversalWindowBlocks = 10;
+        jitWindowBlocks = 10;
     }
 
     function setGovernance(address _governance) external onlyGovernance {
@@ -84,6 +98,19 @@ contract MEVDetector {
         emit PriceImpactThresholdUpdated(poolId, newThreshold);
     }
 
+    event ReversalWindowBlocksUpdated(uint32 newWindow);
+    event JitWindowBlocksUpdated(uint32 newWindow);
+
+    function setReversalWindowBlocks(uint32 _reversalWindowBlocks) external onlyGovernance {
+        reversalWindowBlocks = _reversalWindowBlocks;
+        emit ReversalWindowBlocksUpdated(_reversalWindowBlocks);
+    }
+
+    function setJitWindowBlocks(uint32 _jitWindowBlocks) external onlyGovernance {
+        jitWindowBlocks = _jitWindowBlocks;
+        emit JitWindowBlocksUpdated(_jitWindowBlocks);
+    }
+
     /// @notice Helper for transient storage write
     function _tstore(bytes32 key, uint256 val) internal {
         assembly {
@@ -98,7 +125,7 @@ contract MEVDetector {
         }
     }
 
-    /// @notice Called by MRLVHook before add liquidity to set JIT flag in transient storage
+    /// @notice Called by MRLVHook before add liquidity to record block number in persistent storage
     function onBeforeAddLiquidity(
         PoolKey calldata key,
         ModifyLiquidityParams calldata,
@@ -109,9 +136,7 @@ contract MEVDetector {
         // Use tx.origin to catch atomic EOA transactions across contract proxies
         address targetAddress = tx.origin != address(0) ? tx.origin : sender;
 
-        // Namespace transient key by (poolId, address, block.number)
-        bytes32 jitKey = keccak256(abi.encode("JIT_ADD", poolId, targetAddress, block.number));
-        _tstore(jitKey, 1);
+        lastAddLiquidityBlock[poolId][targetAddress] = block.number;
     }
 
     /// @notice Scores a swap transaction for MEV signals
@@ -136,9 +161,7 @@ contract MEVDetector {
         }
 
         // 2. Same-block opposite-direction swap / reversal (+30)
-        if (_checkSameBlockReversal(poolId, targetAddress, params.zeroForOne)) {
-            total += REVERSAL_POINTS;
-        }
+        total += _checkReversalPattern(poolId, targetAddress, params.zeroForOne);
 
         // 3. Large price impact (+20)
         if (_checkLargePriceImpact(poolId, params.amountSpecified)) {
@@ -146,9 +169,7 @@ contract MEVDetector {
         }
 
         // 4. JIT liquidity pattern (+40)
-        if (_checkJITPattern(poolId, targetAddress)) {
-            total += JIT_POINTS;
-        }
+        total += _checkJITPattern(poolId, targetAddress);
 
         // Cap score at 100
         return total > 100 ? 100 : total;
@@ -167,18 +188,20 @@ contract MEVDetector {
         }
     }
 
-    function _checkSameBlockReversal(bytes32 poolId, address targetAddress, bool zeroForOne) internal returns (bool) {
-        bytes32 reversalKey = keccak256(abi.encode("SAME_BLOCK_REVERSAL", poolId, targetAddress, block.number));
-        uint256 prevDir = _tload(reversalKey);
-        uint256 currentDir = zeroForOne ? 1 : 2;
+    function _checkReversalPattern(bytes32 poolId, address trader, bool zeroForOne) internal returns (uint8 points) {
+        TradeRecord storage record = tradeHistory[poolId][trader];
 
-        bool isReversal = false;
-        if (prevDir != 0 && prevDir != currentDir) {
-            isReversal = true;
+        if (record.hasTraded
+            && record.lastZeroForOne != zeroForOne
+            && block.number - record.lastSwapBlock <= reversalWindowBlocks) {
+            points = REVERSAL_POINTS;
         }
 
-        _tstore(reversalKey, currentDir);
-        return isReversal;
+        // Update history AFTER scoring this swap, so the check above reflects the trader's
+        // PRIOR swap, not the current one.
+        record.lastZeroForOne = zeroForOne;
+        record.lastSwapBlock = uint32(block.number);
+        record.hasTraded = true;
     }
 
     function _checkLargePriceImpact(bytes32 poolId, int256 amountSpecified) internal view returns (bool) {
@@ -190,8 +213,10 @@ contract MEVDetector {
         return absAmount > int256(threshold);
     }
 
-    function _checkJITPattern(bytes32 poolId, address targetAddress) internal view returns (bool) {
-        bytes32 jitKey = keccak256(abi.encode("JIT_ADD", poolId, targetAddress, block.number));
-        return _tload(jitKey) == 1;
+    function _checkJITPattern(bytes32 poolId, address trader) internal view returns (uint8 points) {
+        uint256 addedAt = lastAddLiquidityBlock[poolId][trader];
+        if (addedAt != 0 && block.number - addedAt <= jitWindowBlocks) {
+            points = JIT_POINTS;
+        }
     }
 }
