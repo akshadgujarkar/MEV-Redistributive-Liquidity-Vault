@@ -12,3 +12,6 @@ docs/
 lib
 # Dotenv file
 .env
+
+phase1change.md
+PHASE1_NOTES.md

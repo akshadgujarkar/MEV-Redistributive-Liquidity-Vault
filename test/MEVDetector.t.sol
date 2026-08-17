@@ -11,7 +11,7 @@ import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/Pool
 
 contract MEVDetectorTest is Test {
     MEVDetector public detector;
-
+    
     address public governance = address(0x1);
     address public hook = address(0x2);
     address public oracleRelayer = address(0x3);
@@ -79,7 +79,7 @@ contract MEVDetectorTest is Test {
         vm.stopPrank();
     }
 
-    function test_SameBlockReversalSignal() public {
+    function test_ReversalSignal_SameBlock() public {
         vm.startPrank(hook);
 
         SwapParams memory params0For1 = SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
@@ -96,7 +96,45 @@ contract MEVDetectorTest is Test {
         vm.stopPrank();
     }
 
-    function test_SameBlockSameDirectionNoReversal() public {
+    function test_ReversalSignal_CrossBlock_Inclusive() public {
+        vm.startPrank(hook);
+
+        SwapParams memory params0For1 = SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
+        SwapParams memory params1For0 = SwapParams({zeroForOne: false, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
+
+        uint256 score1 = detector.scoreSwap(testKey, params0For1, address(this), "");
+        assertEq(score1, 0);
+
+        // Advance to exactly reversalWindowBlocks
+        uint256 startBlock = block.number;
+        vm.roll(startBlock + detector.reversalWindowBlocks());
+
+        uint256 score2 = detector.scoreSwap(testKey, params1For0, address(this), "");
+        assertEq(score2, 30, "Reversal swap on boundary block should add 30 points");
+
+        vm.stopPrank();
+    }
+
+    function test_ReversalSignal_CrossBlock_Exclusive() public {
+        vm.startPrank(hook);
+
+        SwapParams memory params0For1 = SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
+        SwapParams memory params1For0 = SwapParams({zeroForOne: false, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
+
+        uint256 score1 = detector.scoreSwap(testKey, params0For1, address(this), "");
+        assertEq(score1, 0);
+
+        // Advance to reversalWindowBlocks + 1
+        uint256 startBlock = block.number;
+        vm.roll(startBlock + detector.reversalWindowBlocks() + 1);
+
+        uint256 score2 = detector.scoreSwap(testKey, params1For0, address(this), "");
+        assertEq(score2, 0, "Reversal swap past boundary block should not add points");
+
+        vm.stopPrank();
+    }
+
+    function test_ReversalSignal_SameDirection_NoReversal() public {
         vm.startPrank(hook);
 
         SwapParams memory params0For1 = SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
@@ -106,8 +144,33 @@ contract MEVDetectorTest is Test {
         assertEq(score1, 0);
 
         // Swap 2: zeroForOne = true (same direction) -> 0 pts
+        vm.roll(block.number + 5);
         uint256 score2 = detector.scoreSwap(testKey, params0For1, address(this), "");
-        assertEq(score2, 0, "Same direction swap in same block should add 0 points");
+        assertEq(score2, 0, "Same direction swap in window should add 0 points");
+
+        vm.stopPrank();
+    }
+
+    function test_ReversalSignal_DifferentPools_NoReversal() public {
+        vm.startPrank(hook);
+
+        SwapParams memory params0For1 = SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
+        SwapParams memory params1For0 = SwapParams({zeroForOne: false, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
+
+        uint256 score1 = detector.scoreSwap(testKey, params0For1, address(this), "");
+        assertEq(score1, 0);
+
+        // Create second pool key
+        PoolKey memory key2 = PoolKey({
+            currency0: Currency.wrap(address(0x300)),
+            currency1: Currency.wrap(address(0x400)),
+            fee: 3000,
+            tickSpacing: 60,
+            hooks: IHooks(hook)
+        });
+
+        uint256 score2 = detector.scoreSwap(key2, params1For0, address(this), "");
+        assertEq(score2, 0, "Swap in different pool should not trigger reversal");
 
         vm.stopPrank();
     }
@@ -142,7 +205,7 @@ contract MEVDetectorTest is Test {
         vm.stopPrank();
     }
 
-    function test_JITPatternSignal() public {
+    function test_JITSignal_SameBlock() public {
         ModifyLiquidityParams memory modParams = ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
         SwapParams memory swapParams = SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
 
@@ -155,6 +218,56 @@ contract MEVDetectorTest is Test {
         detector.onBeforeAddLiquidity(testKey, modParams, address(this), "");
         assertEq(detector.scoreSwap(testKey, swapParams, address(this), ""), 40, "JIT pattern should add 40 pts");
 
+        vm.stopPrank();
+    }
+
+    function test_JITSignal_CrossBlock_Inclusive() public {
+        ModifyLiquidityParams memory modParams = ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+        SwapParams memory swapParams = SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
+
+        vm.startPrank(hook);
+        detector.onBeforeAddLiquidity(testKey, modParams, address(this), "");
+
+        // Advance to exactly jitWindowBlocks
+        uint256 startBlock = block.number;
+        vm.roll(startBlock + detector.jitWindowBlocks());
+
+        assertEq(detector.scoreSwap(testKey, swapParams, address(this), ""), 40, "JIT pattern on boundary block should add 40 pts");
+        vm.stopPrank();
+    }
+
+    function test_JITSignal_CrossBlock_Exclusive() public {
+        ModifyLiquidityParams memory modParams = ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+        SwapParams memory swapParams = SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
+
+        vm.startPrank(hook);
+        detector.onBeforeAddLiquidity(testKey, modParams, address(this), "");
+
+        // Advance to jitWindowBlocks + 1
+        uint256 startBlock = block.number;
+        vm.roll(startBlock + detector.jitWindowBlocks() + 1);
+
+        assertEq(detector.scoreSwap(testKey, swapParams, address(this), ""), 0, "JIT pattern past boundary block should not add points");
+        vm.stopPrank();
+    }
+
+    function test_JITSignal_DifferentPools_NoJIT() public {
+        ModifyLiquidityParams memory modParams = ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+        SwapParams memory swapParams = SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
+
+        vm.startPrank(hook);
+        detector.onBeforeAddLiquidity(testKey, modParams, address(this), "");
+
+        // Create second pool key
+        PoolKey memory key2 = PoolKey({
+            currency0: Currency.wrap(address(0x300)),
+            currency1: Currency.wrap(address(0x400)),
+            fee: 3000,
+            tickSpacing: 60,
+            hooks: IHooks(hook)
+        });
+
+        assertEq(detector.scoreSwap(key2, swapParams, address(this), ""), 0, "JIT in different pool should not trigger score");
         vm.stopPrank();
     }
 

@@ -235,6 +235,17 @@ contract MRLVHookTest is Test {
         assertEq(feeOverride, expectedFee, "Paused hook should return base fee");
     }
 
+    function test_beforeSwapGasBenchmark() public {
+        PoolKey memory key = _makePoolKey();
+        SwapParams memory params = SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
+
+        vm.prank(poolManagerAddr);
+        uint256 gasStart = gasleft();
+        hook.beforeSwap(address(this), key, params, "");
+        uint256 gasUsed = gasStart - gasleft();
+        emit log_named_uint("Baseline Gas used by beforeSwap", gasUsed);
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     //                    HELPERS
     // ═══════════════════════════════════════════════════════════════════
