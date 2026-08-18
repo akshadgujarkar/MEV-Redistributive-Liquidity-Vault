@@ -6,7 +6,36 @@ import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 
 /// @title MEVDetector
-/// @notice Detects MEV swap patterns using EIP-1153 transient storage and risk scoring
+/// @notice Detects MEV swap patterns using EIP-1153 transient storage and risk scoring.
+///
+/// ## Liquidity Maturation
+/// Every liquidity addition is recorded with its block number. A position is considered
+/// IMMATURE for `liquidityMaturityBlocks` blocks after it was added:
+///
+///   addedBlock + liquidityMaturityBlocks <= currentBlock  →  MATURE
+///
+/// The maturation check (`hasImmatureLiquidity`) is used by MRLVHook to gate swaps:
+/// if the most-recently-added LP position is still immature the hook reverts the entire
+/// swap.  This is the strongest enforcement the Uniswap v4 hook architecture allows —
+/// individual positions cannot be selectively excluded from a swap execution.
+///
+/// ## JIT Detection vs Maturation
+/// These are two separate concerns:
+///  • Maturation  – protocol constraint enforced in MRLVHook._beforeSwap (hard gate).
+///  • JIT scoring – risk/MEV signal in scoreSwap (soft score, 0-100).
+///
+/// JIT_POINTS (+40) are only awarded when the most-recent LP addition is MATURE at the
+/// time of the swap AND the swap falls within jitWindowBlocks.  A swap that fires while
+/// the LP position is immature does NOT receive JIT_POINTS — the swap would have been
+/// reverted by the hook anyway, and awarding points for proximity alone is a false positive.
+///
+/// ## Architecture Note — lastPoolLP tracking
+/// The contract tracks only the most-recently-added LP per pool (`lastPoolLP`).  For
+/// multi-LP pools this means only the latest addition drives the maturation gate.  If
+/// Alice (mature) and Bob (immature) have both added liquidity, Bob's later addition will
+/// block swaps until his position matures.  Once Bob's position is mature Alice's
+/// continues to work normally.  This is documented as a known limitation; a full
+/// position-level registry is deferred to Phase 2.
 contract MEVDetector {
     error NotGovernance();
     error NotHook();
@@ -16,14 +45,14 @@ contract MEVDetector {
     address public hook;
     address public oracleRelayer;
 
-    // Signal point constants
+    // ─── Signal point constants ───────────────────────────────────────
     uint8 public constant PRIORITY_FEE_POINTS = 25;
     uint8 public constant REVERSAL_POINTS = 30;
     uint8 public constant PRICE_IMPACT_POINTS = 20;
     uint8 public constant JIT_POINTS = 40;
 
-    // Default baseline fallback for priority fee anomaly when rolling average is 0
-    // ASSUMPTION: Priority fee anomaly triggers if priorityFee > 2 * rollingPriorityFeeAvg[poolId] (or > 5 gwei if avg is 0)
+    // ASSUMPTION: Priority fee anomaly triggers if priorityFee > 2 * rollingPriorityFeeAvg[poolId]
+    //             (or > 5 gwei if avg is 0)
     uint256 public constant DEFAULT_PRIORITY_FEE_BASELINE = 5 gwei;
 
     // ASSUMPTION: Default price impact threshold is 10 ether specified amount unless configured per pool
@@ -51,26 +80,49 @@ contract MEVDetector {
 
     uint32 public globalSequence;
 
-    // Transient storage keys
+    // ─── Transient storage keys (EIP-1153) ───────────────────────────
     bytes32 private constant ATOMIC_ADD_LP_KEY = keccak256("MRLV_ATOMIC_ADD_LP");
     bytes32 private constant ATOMIC_SWAP_OCCURRED_KEY = keccak256("MRLV_ATOMIC_SWAP_OCCURRED");
 
+    // ─── Persistent liquidity tracking ───────────────────────────────
+    /// @dev Maps poolId → LP address → their most recent liquidity addition record.
     mapping(bytes32 => mapping(address => LiquidityRecord)) public lastAdditions;
+
+    /// @dev Most recently added LP address per pool. Used as the maturation sentinel:
+    ///      if this LP's addition is immature the pool is gated for swaps.
+    ///      Limitation: single-LP tracking only — the most recent addition overwrites
+    ///      the previous one.  Multi-LP position-level tracking is a Phase 2 concern.
     mapping(bytes32 => address) public lastPoolLP;
+
     mapping(bytes32 => uint32) public lastSwapBlock;
     mapping(bytes32 => uint32) public lastSwapSequence;
 
-    event JITConfirmed(bytes32 indexed poolId, address indexed lp, bool isAtomic);
-
+    /// @dev Legacy per-(pool, address) block tracker kept for backward compatibility.
     mapping(bytes32 => mapping(address => uint256)) public lastAddLiquidityBlock;
+
+    // ─── Configurable windows ─────────────────────────────────────────
+
+    /// @notice Number of blocks after which a liquidity addition is considered MATURE.
+    ///         Boundary: addedBlock + liquidityMaturityBlocks <= currentBlock → MATURE.
+    ///         Default: 5.
+    uint32 public liquidityMaturityBlocks;
+
+    /// @notice Number of blocks within which add→swap→remove is flagged as potential JIT.
+    ///         JIT scoring only fires when the LP position is ALREADY MATURE at swap time.
     uint32 public jitWindowBlocks;
 
+    // ─── Events ──────────────────────────────────────────────────────
+    event JITConfirmed(bytes32 indexed poolId, address indexed lp, bool isAtomic);
     event GovernanceUpdated(address indexed newGovernance);
     event HookUpdated(address indexed newHook);
     event OracleRelayerUpdated(address indexed newRelayer);
     event RollingPriorityFeeAvgUpdated(bytes32 indexed poolId, uint256 newAvg);
     event PriceImpactThresholdUpdated(bytes32 indexed poolId, uint256 newThreshold);
+    event ReversalWindowBlocksUpdated(uint32 newWindow);
+    event JitWindowBlocksUpdated(uint32 newWindow);
+    event LiquidityMaturityBlocksUpdated(uint32 newMaturity);
 
+    // ─── Modifiers ───────────────────────────────────────────────────
     modifier onlyGovernance() {
         if (msg.sender != governance) revert NotGovernance();
         _;
@@ -86,14 +138,18 @@ contract MEVDetector {
         _;
     }
 
+    // ─── Constructor ─────────────────────────────────────────────────
     constructor(address _governance, address _hook, address _oracleRelayer) {
         governance = _governance;
         hook = _hook;
         oracleRelayer = _oracleRelayer;
         reversalWindowBlocks = 10;
         jitWindowBlocks = 10;
+        // Liquidity must be held for 5 blocks before it is eligible for swap participation.
+        liquidityMaturityBlocks = 5;
     }
 
+    // ─── Governance setters ───────────────────────────────────────────
     function setGovernance(address _governance) external onlyGovernance {
         governance = _governance;
         emit GovernanceUpdated(_governance);
@@ -119,9 +175,6 @@ contract MEVDetector {
         emit PriceImpactThresholdUpdated(poolId, newThreshold);
     }
 
-    event ReversalWindowBlocksUpdated(uint32 newWindow);
-    event JitWindowBlocksUpdated(uint32 newWindow);
-
     function setReversalWindowBlocks(uint32 _reversalWindowBlocks) external onlyGovernance {
         reversalWindowBlocks = _reversalWindowBlocks;
         emit ReversalWindowBlocksUpdated(_reversalWindowBlocks);
@@ -132,6 +185,15 @@ contract MEVDetector {
         emit JitWindowBlocksUpdated(_jitWindowBlocks);
     }
 
+    /// @notice Sets the number of blocks a liquidity position must age before it is
+    ///         considered mature and eligible for swap participation.
+    /// @param _maturityBlocks Number of blocks required (default 5).
+    function setLiquidityMaturityBlocks(uint32 _maturityBlocks) external onlyGovernance {
+        liquidityMaturityBlocks = _maturityBlocks;
+        emit LiquidityMaturityBlocksUpdated(_maturityBlocks);
+    }
+
+    // ─── Transient storage helpers (EIP-1153) ────────────────────────
     /// @notice Helper for transient storage write
     function _tstore(bytes32 key, uint256 val) internal {
         assembly {
@@ -146,7 +208,36 @@ contract MEVDetector {
         }
     }
 
-    /// @notice Called by MRLVHook before add liquidity to record block number in persistent storage
+    // ─── Maturation gate ─────────────────────────────────────────────
+
+    /// @notice Returns true if the most-recently-added LP in `poolId` has a position
+    ///         that has NOT yet reached `liquidityMaturityBlocks` of age.
+    ///
+    ///         Maturity boundary (inclusive):
+    ///             block.number >= record.blockNumber + liquidityMaturityBlocks  →  MATURE
+    ///
+    ///         Example with liquidityMaturityBlocks = 5:
+    ///             addedBlock = 100
+    ///             blocks 100-104  →  immature  (returns true)
+    ///             block  105      →  mature    (returns false)
+    ///
+    /// @dev Called by MRLVHook._beforeSwap to enforce the hard maturation gate.
+    ///      Only the most-recently-added LP is checked (see architecture note above).
+    function hasImmatureLiquidity(bytes32 poolId) external view returns (bool) {
+        address lp = lastPoolLP[poolId];
+        if (lp == address(0)) return false; // no LP has ever added to this pool
+
+        LiquidityRecord memory record = lastAdditions[poolId][lp];
+        if (record.blockNumber == 0) return false; // no record found (defensive)
+
+        // MATURE when: block.number >= record.blockNumber + liquidityMaturityBlocks
+        return block.number < uint256(record.blockNumber) + uint256(liquidityMaturityBlocks);
+    }
+
+    // ─── Liquidity lifecycle callbacks ────────────────────────────────
+
+    /// @notice Called by MRLVHook before add liquidity to record block number in
+    ///         persistent storage and set the atomic JIT transient flag.
     function onBeforeAddLiquidity(
         PoolKey calldata key,
         ModifyLiquidityParams calldata params,
@@ -154,15 +245,14 @@ contract MEVDetector {
         bytes calldata
     ) external onlyHook {
         bytes32 poolId = PoolId.unwrap(key.toId());
-        // Use tx.origin to catch atomic EOA transactions across contract proxies
         address targetAddress = sender;
 
         lastAddLiquidityBlock[poolId][targetAddress] = block.number;
 
-        // Set EIP-1153 transient storage flag for atomic JIT
+        // Set EIP-1153 transient storage flag for atomic JIT detection
         _tstore(ATOMIC_ADD_LP_KEY, uint256(uint160(targetAddress)));
 
-        // Record in persistent storage for cross-transaction JIT
+        // Record in persistent storage for cross-transaction JIT detection
         lastAdditions[poolId][targetAddress] = LiquidityRecord({
             blockNumber: uint32(block.number),
             sequenceNumber: ++globalSequence,
@@ -171,10 +261,22 @@ contract MEVDetector {
             liquidity: params.liquidityDelta > 0 ? uint128(uint256(params.liquidityDelta)) : 0
         });
 
+        // Update the pool's most-recent-LP pointer
         lastPoolLP[poolId] = targetAddress;
     }
 
-    /// @notice Called by MRLVHook before remove liquidity to check and handle JIT confirmation
+    /// @notice Called by MRLVHook before remove liquidity to check and handle JIT
+    ///         confirmation.
+    ///
+    ///         Cross-tx JIT requires ALL of:
+    ///           1. LP has a recorded addition in this pool.
+    ///           2. Removal is within jitWindowBlocks of the addition.
+    ///           3. A swap occurred AFTER the addition (by sequence number).
+    ///           4. The swap occurred AFTER the LP's position was mature — i.e.,
+    ///              lastSwapBlock >= addedBlock + liquidityMaturityBlocks.
+    ///              (Immature liquidity cannot have legitimately participated in
+    ///               the swap, so the classic JIT pattern cannot be confirmed.)
+    ///           5. Tick range of removal matches the recorded addition.
     function onBeforeRemoveLiquidity(
         PoolKey calldata key,
         ModifyLiquidityParams calldata params,
@@ -183,7 +285,9 @@ contract MEVDetector {
         bytes32 poolId = PoolId.unwrap(key.toId());
         address remover = sender;
 
-        // 1. Check Atomic JIT
+        // ── 1. Check Atomic JIT ─────────────────────────────────────
+        // Atomic JIT: add + swap + remove all in the same tx.
+        // Transient storage is set by onBeforeAddLiquidity and cleared between txs.
         address atomicLP = address(uint160(_tload(ATOMIC_ADD_LP_KEY)));
         uint256 atomicSwap = _tload(ATOMIC_SWAP_OCCURRED_KEY);
         if (remover == atomicLP && atomicSwap == 1) {
@@ -191,17 +295,27 @@ contract MEVDetector {
             return;
         }
 
-        // 2. Check Cross-Transaction JIT
+        // ── 2. Check Cross-Transaction JIT ──────────────────────────
         LiquidityRecord memory record = lastAdditions[poolId][remover];
-        if (record.blockNumber != 0 && block.number - record.blockNumber <= jitWindowBlocks) {
-            // Was there a swap after addition?
-            if (lastSwapBlock[poolId] >= record.blockNumber && lastSwapSequence[poolId] > record.sequenceNumber) {
-                // Verify tick range overlap
-                if (params.tickLower == record.tickLower && params.tickUpper == record.tickUpper) {
-                    emit JITConfirmed(poolId, remover, false);
-                }
-            }
-        }
+        if (record.blockNumber == 0) return; // no prior addition recorded
+
+        // Removal must be within the JIT observation window
+        if (block.number - record.blockNumber > jitWindowBlocks) return;
+
+        // A swap must have occurred after the addition (sequence-number check)
+        if (lastSwapBlock[poolId] < record.blockNumber) return;
+        if (lastSwapSequence[poolId] <= record.sequenceNumber) return;
+
+        // The swap must have occurred AFTER this LP's position was mature.
+        // If the swap happened while the position was immature, the position
+        // could not have legitimately participated — no JIT confirmation.
+        uint256 maturityBlock = uint256(record.blockNumber) + uint256(liquidityMaturityBlocks);
+        if (uint256(lastSwapBlock[poolId]) < maturityBlock) return;
+
+        // Tick range of the removal must match the recorded addition
+        if (params.tickLower != record.tickLower || params.tickUpper != record.tickUpper) return;
+
+        emit JITConfirmed(poolId, remover, false);
     }
 
     /// @notice Clears transient storage for testing or manual overrides
@@ -210,7 +324,9 @@ contract MEVDetector {
         _tstore(ATOMIC_SWAP_OCCURRED_KEY, 0);
     }
 
-    /// @notice Scores a swap transaction for MEV signals
+    // ─── Swap scoring ────────────────────────────────────────────────
+
+    /// @notice Scores a swap transaction for MEV signals.
     /// @param key Pool key
     /// @param params Swap params
     /// @param sender Calling address
@@ -223,11 +339,12 @@ contract MEVDetector {
     ) external onlyHook returns (uint256 riskScore) {
         bytes32 poolId = PoolId.unwrap(key.toId());
         address targetAddress = sender;
-        // Record swap timing/order
+
+        // Record swap timing / sequence for cross-tx JIT confirmation
         lastSwapBlock[poolId] = uint32(block.number);
         lastSwapSequence[poolId] = ++globalSequence;
 
-        // Check EIP-1153 transient storage for atomic swap
+        // Set atomic swap flag if there is an active atomic LP in this tx
         address atomicLP = address(uint160(_tload(ATOMIC_ADD_LP_KEY)));
         if (atomicLP != address(0) && atomicLP != sender) {
             _tstore(ATOMIC_SWAP_OCCURRED_KEY, 1);
@@ -248,12 +365,18 @@ contract MEVDetector {
             total += PRICE_IMPACT_POINTS;
         }
 
-        // 4. JIT liquidity pattern (+40)
-        total += _checkJITPattern(poolId, targetAddress);
+        // 4. JIT liquidity suspicion signal (+40)
+        //    NOTE: JIT_POINTS are only awarded when the most-recent LP position is
+        //    MATURE at the time of the swap.  If the position is immature the hook
+        //    would have already reverted the swap; awarding points for mere temporal
+        //    proximity is a false positive and is explicitly avoided here.
+        total += _checkJITSuspicion(poolId, targetAddress);
 
         // Cap score at 100
         return total > 100 ? 100 : total;
     }
+
+    // ─── Internal signal checkers ─────────────────────────────────────
 
     function _checkPriorityFeeAnomaly(bytes32 poolId) internal view returns (bool) {
         uint256 priorityFee = tx.gasprice > block.basefee ? tx.gasprice - block.basefee : 0;
@@ -277,8 +400,8 @@ contract MEVDetector {
             points = REVERSAL_POINTS;
         }
 
-        // Update history AFTER scoring this swap, so the check above reflects the trader's
-        // PRIOR swap, not the current one.
+        // Update history AFTER scoring this swap, so the check above reflects the
+        // trader's PRIOR swap direction, not the current one.
         record.lastZeroForOne = zeroForOne;
         record.lastSwapBlock = uint32(block.number);
         record.hasTraded = true;
@@ -293,13 +416,34 @@ contract MEVDetector {
         return absAmount > int256(threshold);
     }
 
-    function _checkJITPattern(bytes32 poolId, address trader) internal view returns (uint8 points) {
+    /// @notice JIT suspicion scoring signal.
+    ///
+    ///         Returns JIT_POINTS (+40) only when ALL of the following hold:
+    ///           • A different address from the swapper recently added liquidity.
+    ///           • That LP's position is NOW MATURE (>= liquidityMaturityBlocks old).
+    ///           • The swap falls within jitWindowBlocks of the addition.
+    ///
+    ///         This deliberately avoids flagging ordinary swaps that happen after a
+    ///         fresh (immature) liquidity addition — that pattern cannot represent
+    ///         JIT liquidity because the hook would have reverted the swap.
+    ///
+    ///         The function is renamed from _checkJITPattern to _checkJITSuspicion
+    ///         to reinforce that this is an early-warning signal, not a confirmation.
+    function _checkJITSuspicion(bytes32 poolId, address trader) internal view returns (uint8 points) {
         address lp = lastPoolLP[poolId];
-        if (lp != address(0) && lp != trader) {
-            LiquidityRecord memory record = lastAdditions[poolId][lp];
-            if (record.blockNumber != 0 && block.number - record.blockNumber <= jitWindowBlocks) {
-                points = JIT_POINTS;
-            }
-        }
+        if (lp == address(0) || lp == trader) return 0;
+
+        LiquidityRecord memory record = lastAdditions[poolId][lp];
+        if (record.blockNumber == 0) return 0;
+
+        uint256 age = block.number - uint256(record.blockNumber);
+
+        // Liquidity must be MATURE (>= liquidityMaturityBlocks blocks old)
+        if (age < uint256(liquidityMaturityBlocks)) return 0;
+
+        // Swap must be within the JIT observation window
+        if (age > uint256(jitWindowBlocks)) return 0;
+
+        return JIT_POINTS;
     }
 }

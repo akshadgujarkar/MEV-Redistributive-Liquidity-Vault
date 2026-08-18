@@ -247,6 +247,66 @@ contract MRLVHookTest is Test {
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    //              LIQUIDITY MATURATION GATE (5-block rule)
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// @notice beforeSwap must revert with ImmatureLiquidityExists when the most-
+    ///         recently-added LP position has not yet matured (< 5 blocks old).
+    function test_beforeSwap_revertsWithImmatureLiquidity() public {
+        PoolKey memory key = _makePoolKey();
+        ModifyLiquidityParams memory lpParams =
+            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+        SwapParams memory params =
+            SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
+
+        // LP adds liquidity via the hook (poolManager calls beforeAddLiquidity)
+        vm.prank(poolManagerAddr);
+        hook.beforeAddLiquidity(address(0xAA), key, lpParams, "");
+
+        // Advance 2 blocks — LP is still immature (age=2 < maturityBlocks=5)
+        vm.roll(block.number + 2);
+
+        // Swap attempt must revert
+        vm.prank(poolManagerAddr);
+        vm.expectRevert(MRLVHook.ImmatureLiquidityExists.selector);
+        hook.beforeSwap(address(0xBB), key, params, "");
+    }
+
+    /// @notice beforeSwap must succeed once the LP position has matured (>= 5 blocks).
+    function test_beforeSwap_succeedsWithMatureLiquidity() public {
+        PoolKey memory key = _makePoolKey();
+        ModifyLiquidityParams memory lpParams =
+            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+        SwapParams memory params =
+            SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
+
+        // LP adds liquidity
+        vm.prank(poolManagerAddr);
+        hook.beforeAddLiquidity(address(0xAA), key, lpParams, "");
+
+        // Advance exactly 5 blocks — LP is now mature (block.number >= addedBlock + 5)
+        vm.roll(block.number + 5);
+
+        // Swap must succeed (no revert)
+        vm.prank(poolManagerAddr);
+        (bytes4 selector_,,) = hook.beforeSwap(address(0xBB), key, params, "");
+        assertEq(selector_, hook.beforeSwap.selector, "beforeSwap should return its selector");
+    }
+
+    /// @notice beforeSwap must succeed when no LP has ever added to the pool.
+    ///         The maturation gate is a no-op when lastPoolLP is address(0).
+    function test_beforeSwap_noLiquidity_succeeds() public {
+        PoolKey memory key = _makePoolKey();
+        SwapParams memory params =
+            SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
+
+        // No prior LP addition — gate is inactive
+        vm.prank(poolManagerAddr);
+        (bytes4 selector_,,) = hook.beforeSwap(address(0xCC), key, params, "");
+        assertEq(selector_, hook.beforeSwap.selector, "beforeSwap with no LP should succeed");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     //                    HELPERS
     // ═══════════════════════════════════════════════════════════════════
 
