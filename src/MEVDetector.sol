@@ -41,6 +41,27 @@ contract MEVDetector {
     mapping(bytes32 => mapping(address => TradeRecord)) public tradeHistory;
     uint32 public reversalWindowBlocks;
 
+    struct LiquidityRecord {
+        uint32 blockNumber;
+        uint32 sequenceNumber;
+        int24 tickLower;
+        int24 tickUpper;
+        uint128 liquidity;
+    }
+
+    uint32 public globalSequence;
+
+    // Transient storage keys
+    bytes32 private constant ATOMIC_ADD_LP_KEY = keccak256("MRLV_ATOMIC_ADD_LP");
+    bytes32 private constant ATOMIC_SWAP_OCCURRED_KEY = keccak256("MRLV_ATOMIC_SWAP_OCCURRED");
+
+    mapping(bytes32 => mapping(address => LiquidityRecord)) public lastAdditions;
+    mapping(bytes32 => address) public lastPoolLP;
+    mapping(bytes32 => uint32) public lastSwapBlock;
+    mapping(bytes32 => uint32) public lastSwapSequence;
+
+    event JITConfirmed(bytes32 indexed poolId, address indexed lp, bool isAtomic);
+
     mapping(bytes32 => mapping(address => uint256)) public lastAddLiquidityBlock;
     uint32 public jitWindowBlocks;
 
@@ -128,7 +149,7 @@ contract MEVDetector {
     /// @notice Called by MRLVHook before add liquidity to record block number in persistent storage
     function onBeforeAddLiquidity(
         PoolKey calldata key,
-        ModifyLiquidityParams calldata,
+        ModifyLiquidityParams calldata params,
         address sender,
         bytes calldata
     ) external onlyHook {
@@ -137,6 +158,56 @@ contract MEVDetector {
         address targetAddress = tx.origin != address(0) ? tx.origin : sender;
 
         lastAddLiquidityBlock[poolId][targetAddress] = block.number;
+
+        // Set EIP-1153 transient storage flag for atomic JIT
+        _tstore(ATOMIC_ADD_LP_KEY, uint256(uint160(targetAddress)));
+
+        // Record in persistent storage for cross-transaction JIT
+        lastAdditions[poolId][targetAddress] = LiquidityRecord({
+            blockNumber: uint32(block.number),
+            sequenceNumber: ++globalSequence,
+            tickLower: params.tickLower,
+            tickUpper: params.tickUpper,
+            liquidity: params.liquidityDelta > 0 ? uint128(uint256(params.liquidityDelta)) : 0
+        });
+
+        lastPoolLP[poolId] = targetAddress;
+    }
+
+    /// @notice Called by MRLVHook before remove liquidity to check and handle JIT confirmation
+    function onBeforeRemoveLiquidity(
+        PoolKey calldata key,
+        ModifyLiquidityParams calldata params,
+        address sender
+    ) external onlyHook {
+        bytes32 poolId = PoolId.unwrap(key.toId());
+        address remover = tx.origin != address(0) ? tx.origin : sender;
+
+        // 1. Check Atomic JIT
+        address atomicLP = address(uint160(_tload(ATOMIC_ADD_LP_KEY)));
+        uint256 atomicSwap = _tload(ATOMIC_SWAP_OCCURRED_KEY);
+        if (remover == atomicLP && atomicSwap == 1) {
+            emit JITConfirmed(poolId, remover, true);
+            return;
+        }
+
+        // 2. Check Cross-Transaction JIT
+        LiquidityRecord memory record = lastAdditions[poolId][remover];
+        if (record.blockNumber != 0 && block.number - record.blockNumber <= jitWindowBlocks) {
+            // Was there a swap after addition?
+            if (lastSwapBlock[poolId] >= record.blockNumber && lastSwapSequence[poolId] > record.sequenceNumber) {
+                // Verify tick range overlap
+                if (params.tickLower == record.tickLower && params.tickUpper == record.tickUpper) {
+                    emit JITConfirmed(poolId, remover, false);
+                }
+            }
+        }
+    }
+
+    /// @notice Clears transient storage for testing or manual overrides
+    function clearTransientState() external {
+        _tstore(ATOMIC_ADD_LP_KEY, 0);
+        _tstore(ATOMIC_SWAP_OCCURRED_KEY, 0);
     }
 
     /// @notice Scores a swap transaction for MEV signals
@@ -152,6 +223,16 @@ contract MEVDetector {
     ) external onlyHook returns (uint256 riskScore) {
         bytes32 poolId = PoolId.unwrap(key.toId());
         address targetAddress = tx.origin != address(0) ? tx.origin : sender;
+
+        // Record swap timing/order
+        lastSwapBlock[poolId] = uint32(block.number);
+        lastSwapSequence[poolId] = ++globalSequence;
+
+        // Check EIP-1153 transient storage for atomic swap
+        address atomicLP = address(uint160(_tload(ATOMIC_ADD_LP_KEY)));
+        if (atomicLP != address(0) && atomicLP != sender) {
+            _tstore(ATOMIC_SWAP_OCCURRED_KEY, 1);
+        }
 
         uint256 total = 0;
 
@@ -214,9 +295,12 @@ contract MEVDetector {
     }
 
     function _checkJITPattern(bytes32 poolId, address trader) internal view returns (uint8 points) {
-        uint256 addedAt = lastAddLiquidityBlock[poolId][trader];
-        if (addedAt != 0 && block.number - addedAt <= jitWindowBlocks) {
-            points = JIT_POINTS;
+        address lp = lastPoolLP[poolId];
+        if (lp != address(0) && lp != trader) {
+            LiquidityRecord memory record = lastAdditions[poolId][lp];
+            if (record.blockNumber != 0 && block.number - record.blockNumber <= jitWindowBlocks) {
+                points = JIT_POINTS;
+            }
         }
     }
 }

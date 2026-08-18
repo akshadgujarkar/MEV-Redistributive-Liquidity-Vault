@@ -248,12 +248,12 @@ contract MRLVHook is BaseHook {
 
     // ─── beforeRemoveLiquidity ───────────────────────────────────────
     function _beforeRemoveLiquidity(
-        address,
-        PoolKey calldata,
-        ModifyLiquidityParams calldata,
+        address sender,
+        PoolKey calldata key,
+        ModifyLiquidityParams calldata params,
         bytes calldata
     ) internal override returns (bytes4) {
-        // TODO(Phase 2): Check exit penalties via LoyaltyManager
+        detector.onBeforeRemoveLiquidity(key, params, sender);
         return this.beforeRemoveLiquidity.selector;
     }
 

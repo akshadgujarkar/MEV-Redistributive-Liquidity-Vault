@@ -19,6 +19,8 @@ contract MEVDetectorTest is Test {
     PoolKey public testKey;
     bytes32 public poolId;
 
+    event JITConfirmed(bytes32 indexed poolId, address indexed lp, bool isAtomic);
+
     function setUp() public {
         detector = new MEVDetector(governance, hook, oracleRelayer);
 
@@ -216,9 +218,10 @@ contract MEVDetectorTest is Test {
 
         // 2. Call onBeforeAddLiquidity then swap in same block -> +40 pts
         detector.onBeforeAddLiquidity(testKey, modParams, address(this), "");
-        assertEq(detector.scoreSwap(testKey, swapParams, address(this), ""), 40, "JIT pattern should add 40 pts");
-
         vm.stopPrank();
+        
+        vm.prank(hook, address(0x123));
+        assertEq(detector.scoreSwap(testKey, swapParams, address(0x123), ""), 40, "JIT pattern should add 40 pts");
     }
 
     function test_JITSignal_CrossBlock_Inclusive() public {
@@ -231,9 +234,10 @@ contract MEVDetectorTest is Test {
         // Advance to exactly jitWindowBlocks
         uint256 startBlock = block.number;
         vm.roll(startBlock + detector.jitWindowBlocks());
-
-        assertEq(detector.scoreSwap(testKey, swapParams, address(this), ""), 40, "JIT pattern on boundary block should add 40 pts");
         vm.stopPrank();
+
+        vm.prank(hook, address(0x123));
+        assertEq(detector.scoreSwap(testKey, swapParams, address(0x123), ""), 40, "JIT pattern on boundary block should add 40 pts");
     }
 
     function test_JITSignal_CrossBlock_Exclusive() public {
@@ -246,9 +250,10 @@ contract MEVDetectorTest is Test {
         // Advance to jitWindowBlocks + 1
         uint256 startBlock = block.number;
         vm.roll(startBlock + detector.jitWindowBlocks() + 1);
-
-        assertEq(detector.scoreSwap(testKey, swapParams, address(this), ""), 0, "JIT pattern past boundary block should not add points");
         vm.stopPrank();
+
+        vm.prank(hook, address(0x123));
+        assertEq(detector.scoreSwap(testKey, swapParams, address(0x123), ""), 0, "JIT pattern past boundary block should not add points");
     }
 
     function test_JITSignal_DifferentPools_NoJIT() public {
@@ -286,9 +291,12 @@ contract MEVDetectorTest is Test {
 
         // Seed reversal state (swap 1: zeroForOne = false)
         SwapParams memory params1 = SwapParams({zeroForOne: false, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
-        detector.scoreSwap(testKey, params1, address(this), "");
+        vm.stopPrank();
+        vm.prank(hook, address(0x123));
+        detector.scoreSwap(testKey, params1, address(0x123), "");
 
         // Set JIT flag
+        vm.prank(hook);
         ModifyLiquidityParams memory modParams = ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
         detector.onBeforeAddLiquidity(testKey, modParams, address(this), "");
 
@@ -299,9 +307,56 @@ contract MEVDetectorTest is Test {
         // Attack swap: zeroForOne = true (opposite to swap 1 -> +30), amount = -15 ether (> 10 ether -> +20), JIT flag active (+40)
         SwapParams memory attackParams = SwapParams({zeroForOne: true, amountSpecified: -15 ether, sqrtPriceLimitX96: 0});
 
-        uint256 finalScore = detector.scoreSwap(testKey, attackParams, address(this), "");
+        vm.prank(hook, address(0x123));
+        uint256 finalScore = detector.scoreSwap(testKey, attackParams, address(0x123), "");
         assertEq(finalScore, 100, "Aggregated score 115 should cap at 100");
+    }
 
+    function test_JITConfirmation_CrossTx() public {
+        ModifyLiquidityParams memory addParams = ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+        ModifyLiquidityParams memory removeParams = ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: -1000, salt: 0});
+        SwapParams memory swapParams = SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
+
+        // 1. LP Alice adds liquidity
+        vm.prank(hook, address(0xAA));
+        detector.onBeforeAddLiquidity(testKey, addParams, address(0xAA), "");
+
+        // Simulate transition to new transaction by clearing transient storage
+        detector.clearTransientState();
+
+        // 2. Swapper Bob swaps (Alice's position is JIT candidate)
+        vm.prank(hook, address(0xBB));
+        detector.scoreSwap(testKey, swapParams, address(0xBB), "");
+
+        // Simulate transition to new transaction by clearing transient storage
+        detector.clearTransientState();
+
+        // 3. LP Alice removes liquidity (JIT Confirmed)
+        vm.prank(hook, address(0xAA));
+        vm.expectEmit(true, true, false, true);
+        emit JITConfirmed(poolId, address(0xAA), false);
+        detector.onBeforeRemoveLiquidity(testKey, removeParams, address(0xAA));
+    }
+
+    function test_JITConfirmation_Atomic() public {
+        ModifyLiquidityParams memory addParams = ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+        ModifyLiquidityParams memory removeParams = ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: -1000, salt: 0});
+        SwapParams memory swapParams = SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
+
+        // Atomic JIT: Alice adds, Bob swaps, Alice removes in SAME tx
+        vm.startPrank(hook, address(0xAA));
+        
+        // 1. ADD
+        detector.onBeforeAddLiquidity(testKey, addParams, address(0xAA), "");
+
+        // 2. SWAP (by Bob)
+        detector.scoreSwap(testKey, swapParams, address(0xBB), "");
+
+        // 3. REMOVE
+        vm.expectEmit(true, true, false, true);
+        emit JITConfirmed(poolId, address(0xAA), true);
+        detector.onBeforeRemoveLiquidity(testKey, removeParams, address(0xAA));
+        
         vm.stopPrank();
     }
 }
