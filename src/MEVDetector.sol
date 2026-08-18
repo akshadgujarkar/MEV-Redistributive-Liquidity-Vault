@@ -155,7 +155,7 @@ contract MEVDetector {
     ) external onlyHook {
         bytes32 poolId = PoolId.unwrap(key.toId());
         // Use tx.origin to catch atomic EOA transactions across contract proxies
-        address targetAddress = tx.origin != address(0) ? tx.origin : sender;
+        address targetAddress = sender;
 
         lastAddLiquidityBlock[poolId][targetAddress] = block.number;
 
@@ -181,7 +181,7 @@ contract MEVDetector {
         address sender
     ) external onlyHook {
         bytes32 poolId = PoolId.unwrap(key.toId());
-        address remover = tx.origin != address(0) ? tx.origin : sender;
+        address remover = sender;
 
         // 1. Check Atomic JIT
         address atomicLP = address(uint160(_tload(ATOMIC_ADD_LP_KEY)));
@@ -222,8 +222,7 @@ contract MEVDetector {
         bytes calldata
     ) external onlyHook returns (uint256 riskScore) {
         bytes32 poolId = PoolId.unwrap(key.toId());
-        address targetAddress = tx.origin != address(0) ? tx.origin : sender;
-
+        address targetAddress = sender;
         // Record swap timing/order
         lastSwapBlock[poolId] = uint32(block.number);
         lastSwapSequence[poolId] = ++globalSequence;

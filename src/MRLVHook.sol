@@ -208,7 +208,7 @@ contract MRLVHook is BaseHook {
                 : 0;
             analytics.emitMEVDetected(poolId, ctx.trader, ctx.riskScore, surcharge);
         }
-
+    
         // TODO(Phase 2): Compute surcharge amount from (appliedFee - BASE_FEE) * notional
         //                 and call RewardVault.deposit(poolId, surchargeAmount)
         // TODO(Phase 2): Call LoyaltyManager to update per-swap stats
