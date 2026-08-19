@@ -14,28 +14,22 @@ import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/Pool
 ///
 ///   addedBlock + liquidityMaturityBlocks <= currentBlock  →  MATURE
 ///
-/// The maturation check (`hasImmatureLiquidity`) is used by MRLVHook to gate swaps:
-/// if the most-recently-added LP position is still immature the hook reverts the entire
-/// swap.  This is the strongest enforcement the Uniswap v4 hook architecture allows —
-/// individual positions cannot be selectively excluded from a swap execution.
+/// Immature liquidity does NOT block or delay ordinary swaps. An LP that has recently
+/// added liquidity and is still within `liquidityMaturityBlocks` is simply ignored for JIT/MEV
+/// participation analysis until it becomes mature.
 ///
 /// ## JIT Detection vs Maturation
 /// These are two separate concerns:
-///  • Maturation  – protocol constraint enforced in MRLVHook._beforeSwap (hard gate).
+///  • Maturation  – filter determining if an LP position is mature enough for JIT analysis.
 ///  • JIT scoring – risk/MEV signal in scoreSwap (soft score, 0-100).
 ///
-/// JIT_POINTS (+40) are only awarded when the most-recent LP addition is MATURE at the
-/// time of the swap AND the swap falls within jitWindowBlocks.  A swap that fires while
-/// the LP position is immature does NOT receive JIT_POINTS — the swap would have been
-/// reverted by the hook anyway, and awarding points for proximity alone is a false positive.
+/// JIT_POINTS (+40) are only awarded when the LP addition is MATURE at the time of the swap
+/// AND the swap falls within jitWindowBlocks. Immature liquidity produces 0 JIT points and does
+/// not cause a swap to revert.
 ///
 /// ## Architecture Note — lastPoolLP tracking
-/// The contract tracks only the most-recently-added LP per pool (`lastPoolLP`).  For
-/// multi-LP pools this means only the latest addition drives the maturation gate.  If
-/// Alice (mature) and Bob (immature) have both added liquidity, Bob's later addition will
-/// block swaps until his position matures.  Once Bob's position is mature Alice's
-/// continues to work normally.  This is documented as a known limitation; a full
-/// position-level registry is deferred to Phase 2.
+/// The contract tracks the most-recently-added LP per pool (`lastPoolLP`) as a convenience
+/// pointer for JIT analysis. It is NOT used as a global pool maturation gate to reject swaps.
 contract MEVDetector {
     error NotGovernance();
     error NotHook();
@@ -221,8 +215,8 @@ contract MEVDetector {
     ///             blocks 100-104  →  immature  (returns true)
     ///             block  105      →  mature    (returns false)
     ///
-    /// @dev Called by MRLVHook._beforeSwap to enforce the hard maturation gate.
-    ///      Only the most-recently-added LP is checked (see architecture note above).
+    /// @dev Returns maturation state for the most-recently-added LP position.
+    ///      Immature liquidity is ignored for JIT scoring and does NOT block ordinary swaps.
     function hasImmatureLiquidity(bytes32 poolId) external view returns (bool) {
         address lp = lastPoolLP[poolId];
         if (lp == address(0)) return false; // no LP has ever added to this pool

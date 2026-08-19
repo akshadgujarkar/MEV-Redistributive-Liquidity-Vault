@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
@@ -250,9 +250,8 @@ contract MRLVHookTest is Test {
     //              LIQUIDITY MATURATION GATE (5-block rule)
     // ═══════════════════════════════════════════════════════════════════
 
-    /// @notice beforeSwap must revert with ImmatureLiquidityExists when the most-
-    ///         recently-added LP position has not yet matured (< 5 blocks old).
-    function test_beforeSwap_revertsWithImmatureLiquidity() public {
+    /// @notice beforeSwap MUST succeed even when the most-recently-added LP position is immature (< 5 blocks old).
+    function test_beforeSwap_succeedsWithImmatureLiquidity() public {
         PoolKey memory key = _makePoolKey();
         ModifyLiquidityParams memory lpParams =
             ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
@@ -266,10 +265,10 @@ contract MRLVHookTest is Test {
         // Advance 2 blocks — LP is still immature (age=2 < maturityBlocks=5)
         vm.roll(block.number + 2);
 
-        // Swap attempt must revert
+        // Normal trader swap attempt MUST succeed
         vm.prank(poolManagerAddr);
-        vm.expectRevert(MRLVHook.ImmatureLiquidityExists.selector);
-        hook.beforeSwap(address(0xBB), key, params, "");
+        (bytes4 selector_,,) = hook.beforeSwap(address(0xBB), key, params, "");
+        assertEq(selector_, hook.beforeSwap.selector, "beforeSwap with immature liquidity should succeed");
     }
 
     /// @notice beforeSwap must succeed once the LP position has matured (>= 5 blocks).
@@ -307,6 +306,392 @@ contract MRLVHookTest is Test {
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    //                     SPECIFIC SCENARIO TESTS
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// @notice Scenario 1 — One immature LP: Alice adds at 100, Bob swaps at 102.
+    ///         Bob's swap MUST succeed and JIT score from Alice must be 0.
+    function test_Scenario1_OneImmatureLP() public {
+        vm.roll(100);
+        PoolKey memory key = _makePoolKey();
+        bytes32 poolId = PoolId.unwrap(key.toId());
+        ModifyLiquidityParams memory lpParams =
+            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+        SwapParams memory params =
+            SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
+
+        address alice = address(0xAA);
+        address bob = address(0xBB);
+
+        // Block 100: Alice adds liquidity
+        vm.prank(poolManagerAddr);
+        hook.beforeAddLiquidity(alice, key, lpParams, "");
+
+        // Block 102: Bob swaps (maturity is 5 blocks)
+        vm.roll(102);
+
+        vm.prank(poolManagerAddr);
+        (bytes4 selector_,,) = hook.beforeSwap(bob, key, params, "");
+        assertEq(selector_, hook.beforeSwap.selector, "Bob's swap must succeed");
+
+        // Verify risk score stored in swap context (JIT points = 0)
+        bytes32 ctxKey = keccak256(abi.encode("SWAP_CTX", poolId, 102, bob));
+        (,,, uint256 riskScore,) = hook._swapContext(ctxKey);
+        assertEq(riskScore, 0, "Immature LP must produce 0 JIT points");
+    }
+
+    /// @notice Scenario 2 — Continuous LP additions:
+    ///         Block 100 Alice, 101 Bob, 102 Charlie, 103 Dave swaps, 104 Eve, 105 Frank swaps.
+    ///         Normal swaps MUST NOT be blocked.
+    function test_Scenario2_ContinuousLPAdditions() public {
+        PoolKey memory key = _makePoolKey();
+        ModifyLiquidityParams memory lpParams =
+            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+        SwapParams memory params =
+            SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
+
+        address alice = address(0xAA);
+        address bob = address(0xBB);
+        address charlie = address(0xCC);
+        address dave = address(0xDD);
+        address eve = address(0xEE);
+        address frank = address(0xFF);
+
+        // Block 100: Alice adds liquidity
+        vm.roll(100);
+        vm.prank(poolManagerAddr);
+        hook.beforeAddLiquidity(alice, key, lpParams, "");
+
+        // Block 101: Bob adds liquidity
+        vm.roll(101);
+        vm.prank(poolManagerAddr);
+        hook.beforeAddLiquidity(bob, key, lpParams, "");
+
+        // Block 102: Charlie adds liquidity
+        vm.roll(102);
+        vm.prank(poolManagerAddr);
+        hook.beforeAddLiquidity(charlie, key, lpParams, "");
+
+        // Block 103: Dave swaps (must succeed)
+        vm.roll(103);
+        vm.prank(poolManagerAddr);
+        (bytes4 sel1,,) = hook.beforeSwap(dave, key, params, "");
+        assertEq(sel1, hook.beforeSwap.selector, "Dave swap must succeed");
+
+        // Block 104: Eve adds liquidity
+        vm.roll(104);
+        vm.prank(poolManagerAddr);
+        hook.beforeAddLiquidity(eve, key, lpParams, "");
+
+        // Block 105: Frank swaps (must succeed)
+        vm.roll(105);
+        vm.prank(poolManagerAddr);
+        (bytes4 sel2,,) = hook.beforeSwap(frank, key, params, "");
+        assertEq(sel2, hook.beforeSwap.selector, "Frank swap must succeed");
+    }
+
+    /// @notice Scenario 3 — Mature LP:
+    ///         Block 100 Alice adds, Block 105+ mature, Block 107 normal trader swaps.
+    ///         Alice can now be considered by JIT suspicion logic.
+    function test_Scenario3_MatureLP_EligibleForJIT() public {
+        vm.roll(100);
+        PoolKey memory key = _makePoolKey();
+        bytes32 poolId = PoolId.unwrap(key.toId());
+        ModifyLiquidityParams memory lpParams =
+            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+        SwapParams memory params =
+            SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
+
+        address alice = address(0xAA);
+        address bob = address(0xBB);
+
+        // Block 100: Alice adds liquidity
+        vm.prank(poolManagerAddr);
+        hook.beforeAddLiquidity(alice, key, lpParams, "");
+
+        // Block 107: Bob swaps (Alice age = 7 >= maturity 5, <= jitWindow 10)
+        vm.roll(107);
+        vm.prank(poolManagerAddr);
+        hook.beforeSwap(bob, key, params, "");
+
+        bytes32 ctxKey = keccak256(abi.encode("SWAP_CTX", poolId, 107, bob));
+        (,,, uint256 riskScore,) = hook._swapContext(ctxKey);
+        assertEq(riskScore, 40, "Mature LP within JIT window must yield 40 JIT points");
+    }
+
+    /// @notice Scenario 4 — Immature add -> swap -> remove:
+    ///         Block 100 Alice adds, Block 102 trader swaps, Block 103 Alice removes.
+    ///         Must NOT emit JITConfirmed.
+    function test_Scenario4_ImmatureAdd_Swap_Remove_NoJITConfirmed() public {
+        vm.roll(100);
+        PoolKey memory key = _makePoolKey();
+        ModifyLiquidityParams memory addP =
+            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+        ModifyLiquidityParams memory removeP =
+            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: -1000, salt: 0});
+        SwapParams memory swapP =
+            SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
+
+        address alice = address(0xAA);
+        address trader = address(0xBB);
+
+        // Block 100: Alice adds liquidity (tx 1)
+        vm.prank(poolManagerAddr);
+        hook.beforeAddLiquidity(alice, key, addP, "");
+        detector.clearTransientState(); // End tx 1 (EIP-1153 transient storage cleared between txs)
+
+        // Block 102: trader swaps (Alice is immature at swap time) (tx 2)
+        vm.roll(102);
+        vm.prank(poolManagerAddr);
+        hook.beforeSwap(trader, key, swapP, "");
+        detector.clearTransientState(); // End tx 2
+
+        // Block 103: Alice removes liquidity (tx 3)
+        vm.roll(103);
+        // Expect NO JITConfirmed event emitted
+        vm.recordLogs();
+        vm.prank(poolManagerAddr);
+        hook.beforeRemoveLiquidity(alice, key, removeP, "");
+
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+        for (uint256 i = 0; i < entries.length; i++) {
+            assertTrue(
+                entries[i].topics[0] != keccak256("JITConfirmed(bytes32,address,bool)"),
+                "JITConfirmed must NOT be emitted for immature LP"
+            );
+        }
+    }
+
+    /// @notice Scenario 5 — Mature add -> swap -> remove:
+    ///         Block 100 Alice adds, Block 105 mature, Block 107 trader swaps, Block 108 Alice removes.
+    ///         Emits JITConfirmed(poolId, Alice, false).
+    function test_Scenario5_MatureAdd_Swap_Remove_EmitsJITConfirmed() public {
+        vm.roll(100);
+        PoolKey memory key = _makePoolKey();
+        bytes32 poolId = PoolId.unwrap(key.toId());
+        ModifyLiquidityParams memory addP =
+            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+        ModifyLiquidityParams memory removeP =
+            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: -1000, salt: 0});
+        SwapParams memory swapP =
+            SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
+
+        address alice = address(0xAA);
+        address trader = address(0xBB);
+
+        // Block 100: Alice adds liquidity (tx 1)
+        vm.prank(poolManagerAddr);
+        hook.beforeAddLiquidity(alice, key, addP, "");
+        detector.clearTransientState(); // End tx 1
+
+        // Block 105: Alice matures (age 5)
+        // Block 107: trader swaps (tx 2)
+        vm.roll(107);
+        vm.prank(poolManagerAddr);
+        hook.beforeSwap(trader, key, swapP, "");
+        detector.clearTransientState(); // End tx 2
+
+        // Block 108: Alice removes liquidity (tx 3)
+        vm.roll(108);
+
+        vm.expectEmit(true, true, false, true);
+        emit MEVDetector.JITConfirmed(poolId, alice, false);
+
+        vm.prank(poolManagerAddr);
+        hook.beforeRemoveLiquidity(alice, key, removeP, "");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //             PENDING LIQUIDITY ESCROW & MATURITY TESTS
+    // ═══════════════════════════════════════════════════════════════════
+
+    function test_depositPendingLiquidity_EscrowsTokensAndRecordsPending() public {
+        MockERC20 token0 = new MockERC20();
+        MockERC20 token1 = new MockERC20();
+        address alice = address(0xAA);
+
+        token0.mint(alice, 1000 ether);
+        token1.mint(alice, 1000 ether);
+
+        PoolKey memory key = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 3000,
+            tickSpacing: 60,
+            hooks: IHooks(address(hook))
+        });
+
+        ModifyLiquidityParams memory lpParams =
+            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+
+        vm.startPrank(alice);
+        token0.approve(address(hook), 500 ether);
+        token1.approve(address(hook), 500 ether);
+
+        bytes32 posKey = hook.depositPendingLiquidity(key, lpParams, 100 ether, 200 ether);
+        vm.stopPrank();
+
+        assertEq(token0.balanceOf(address(hook)), 100 ether, "Hook should escrow token0");
+        assertEq(token1.balanceOf(address(hook)), 200 ether, "Hook should escrow token1");
+
+        (bool isPending, bool isMature, uint256 remaining, uint128 liq, address owner) =
+            hook.getPendingPositionStatus(posKey);
+
+        assertTrue(isPending, "Position should be pending");
+        assertFalse(isMature, "Position should be immature initially");
+        assertEq(remaining, 5, "Remaining blocks should be 5");
+        assertEq(liq, 1000, "Liquidity should match deposit");
+        assertEq(owner, alice, "Owner should be Alice");
+    }
+
+    function test_activateLiquidity_RevertsBeforeMaturity() public {
+        MockERC20 token0 = new MockERC20();
+        MockERC20 token1 = new MockERC20();
+        address alice = address(0xAA);
+
+        token0.mint(alice, 1000 ether);
+        token1.mint(alice, 1000 ether);
+
+        PoolKey memory key = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 3000,
+            tickSpacing: 60,
+            hooks: IHooks(address(hook))
+        });
+
+        ModifyLiquidityParams memory lpParams =
+            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+
+        vm.startPrank(alice);
+        token0.approve(address(hook), 500 ether);
+        token1.approve(address(hook), 500 ether);
+
+        bytes32 posKey = hook.depositPendingLiquidity(key, lpParams, 100 ether, 200 ether);
+        vm.stopPrank();
+
+        // Advance 2 blocks (< maturity 5)
+        vm.roll(block.number + 2);
+
+        vm.expectRevert(MRLVHook.PositionNotMature.selector);
+        hook.activateLiquidity(posKey);
+    }
+
+    function test_activateLiquidity_SucceedsAfterMaturity() public {
+        MockERC20 token0 = new MockERC20();
+        MockERC20 token1 = new MockERC20();
+        address alice = address(0xAA);
+
+        token0.mint(alice, 1000 ether);
+        token1.mint(alice, 1000 ether);
+
+        PoolKey memory key = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 3000,
+            tickSpacing: 60,
+            hooks: IHooks(address(hook))
+        });
+
+        ModifyLiquidityParams memory lpParams =
+            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+
+        vm.startPrank(alice);
+        token0.approve(address(hook), 500 ether);
+        token1.approve(address(hook), 500 ether);
+
+        bytes32 posKey = hook.depositPendingLiquidity(key, lpParams, 100 ether, 200 ether);
+        vm.stopPrank();
+
+        // Advance 5 blocks (>= maturity 5)
+        vm.roll(block.number + 5);
+
+        bool activated = hook.activateLiquidity(posKey);
+        assertTrue(activated, "Activation should succeed");
+
+        (bool isPending, bool isMature, uint256 remaining,,) = hook.getPendingPositionStatus(posKey);
+        assertFalse(isPending, "Position is no longer pending after activation");
+        assertTrue(isMature, "Position is mature");
+        assertEq(remaining, 0, "Remaining blocks should be 0");
+    }
+
+    function test_lazyActivation_OnSwap() public {
+        MockERC20 token0 = new MockERC20();
+        MockERC20 token1 = new MockERC20();
+        address alice = address(0xAA);
+
+        token0.mint(alice, 1000 ether);
+        token1.mint(alice, 1000 ether);
+
+        PoolKey memory key = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 3000,
+            tickSpacing: 60,
+            hooks: IHooks(address(hook))
+        });
+
+        ModifyLiquidityParams memory lpParams =
+            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+
+        vm.startPrank(alice);
+        token0.approve(address(hook), 500 ether);
+        token1.approve(address(hook), 500 ether);
+
+        bytes32 posKey = hook.depositPendingLiquidity(key, lpParams, 100 ether, 200 ether);
+        vm.stopPrank();
+
+        // Advance 6 blocks (mature)
+        vm.roll(block.number + 6);
+
+        // Perform swap
+        SwapParams memory params =
+            SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
+        vm.prank(poolManagerAddr);
+        hook.beforeSwap(address(0xBB), key, params, "");
+
+        // Verify lazy activation executed automatically during beforeSwap
+        (bool isPending, bool isMature,,,)= hook.getPendingPositionStatus(posKey);
+        assertFalse(isPending, "Lazy activation should activate mature position on swap");
+        assertTrue(isMature, "Position should be mature");
+    }
+
+    function test_withdrawPendingLiquidity_ReturnsEscrowedTokens() public {
+        MockERC20 token0 = new MockERC20();
+        MockERC20 token1 = new MockERC20();
+        address alice = address(0xAA);
+
+        token0.mint(alice, 1000 ether);
+        token1.mint(alice, 1000 ether);
+
+        PoolKey memory key = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 3000,
+            tickSpacing: 60,
+            hooks: IHooks(address(hook))
+        });
+
+        ModifyLiquidityParams memory lpParams =
+            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+
+        vm.startPrank(alice);
+        token0.approve(address(hook), 500 ether);
+        token1.approve(address(hook), 500 ether);
+
+        bytes32 posKey = hook.depositPendingLiquidity(key, lpParams, 100 ether, 200 ether);
+
+        // Withdraw before maturity
+        bool withdrawn = hook.withdrawPendingLiquidity(posKey, key);
+        vm.stopPrank();
+
+        assertTrue(withdrawn, "Withdrawal should succeed");
+        assertEq(token0.balanceOf(alice), 1000 ether, "Alice should receive 100% token0 back");
+        assertEq(token1.balanceOf(alice), 1000 ether, "Alice should receive 100% token1 back");
+        assertEq(token0.balanceOf(address(hook)), 0, "Hook should have 0 token0 left");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     //                    HELPERS
     // ═══════════════════════════════════════════════════════════════════
 
@@ -318,5 +703,40 @@ contract MRLVHookTest is Test {
             tickSpacing: 60,
             hooks: IHooks(address(hook))
         });
+    }
+}
+
+contract MockERC20 {
+    string public name = "Mock Token";
+    string public symbol = "MCK";
+    uint8 public decimals = 18;
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        require(balanceOf[msg.sender] >= amount, "Insufficient balance");
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        require(balanceOf[from] >= amount, "Insufficient balance");
+        if (allowance[from][msg.sender] != type(uint256).max) {
+            require(allowance[from][msg.sender] >= amount, "Insufficient allowance");
+            allowance[from][msg.sender] -= amount;
+        }
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
     }
 }
