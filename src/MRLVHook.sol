@@ -25,9 +25,8 @@ contract MRLVHook is BaseHook {
     error NotGovernance();
     error HookIsPaused();
     error InvalidHookData();
-    /// @notice Emitted when a swap is attempted against a pool whose most-recently-added
-    ///         LP position has not yet reached the `liquidityMaturityBlocks` maturation
-    ///         period.  The swap must be retried once the immature position has matured.
+    /// @notice Legacy error retained for ABI compatibility.
+    /// @dev Immature liquidity does not block ordinary swaps. It is excluded from JIT/MEV analysis until mature.
     error ImmatureLiquidityExists();
 
     // ─── State variables (per Architecture.md §3.2) ──────────────────
@@ -51,7 +50,7 @@ contract MRLVHook is BaseHook {
     // But since afterSwap is called in the same tx, we use a simple storage variable
     // that gets overwritten each swap (never read across txs). This is cheaper than
     // re-encoding to transient storage for a struct.
-    mapping(bytes32 => SwapContext) internal _swapContext;
+    mapping(bytes32 => SwapContext) public _swapContext;
 
     // ─── Events ──────────────────────────────────────────────────────
     event Paused(address indexed by);
@@ -162,17 +161,6 @@ contract MRLVHook is BaseHook {
         }
 
         bytes32 poolId = PoolId.unwrap(key.toId());
-
-        // ── Liquidity Maturation Gate ────────────────────────────────
-        // Protocol constraint: swaps are blocked while the most-recently-added LP
-        // position has not yet matured (< liquidityMaturityBlocks blocks old).
-        //
-        // Architecture note: Uniswap v4 hooks cannot selectively exclude individual
-        // positions from swap execution.  The only hook-level enforcement is to revert
-        // the entire swap.  When only mature liquidity exists this gate is a no-op.
-        if (detector.hasImmatureLiquidity(poolId)) {
-            revert ImmatureLiquidityExists();
-        }
 
         // 1. Score swap via MEVDetector
         uint256 riskScore = detector.scoreSwap(key, params, sender, hookData);
