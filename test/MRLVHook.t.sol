@@ -502,6 +502,196 @@ contract MRLVHookTest is Test {
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    //             PENDING LIQUIDITY ESCROW & MATURITY TESTS
+    // ═══════════════════════════════════════════════════════════════════
+
+    function test_depositPendingLiquidity_EscrowsTokensAndRecordsPending() public {
+        MockERC20 token0 = new MockERC20();
+        MockERC20 token1 = new MockERC20();
+        address alice = address(0xAA);
+
+        token0.mint(alice, 1000 ether);
+        token1.mint(alice, 1000 ether);
+
+        PoolKey memory key = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 3000,
+            tickSpacing: 60,
+            hooks: IHooks(address(hook))
+        });
+
+        ModifyLiquidityParams memory lpParams =
+            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+
+        vm.startPrank(alice);
+        token0.approve(address(hook), 500 ether);
+        token1.approve(address(hook), 500 ether);
+
+        bytes32 posKey = hook.depositPendingLiquidity(key, lpParams, 100 ether, 200 ether);
+        vm.stopPrank();
+
+        assertEq(token0.balanceOf(address(hook)), 100 ether, "Hook should escrow token0");
+        assertEq(token1.balanceOf(address(hook)), 200 ether, "Hook should escrow token1");
+
+        (bool isPending, bool isMature, uint256 remaining, uint128 liq, address owner) =
+            hook.getPendingPositionStatus(posKey);
+
+        assertTrue(isPending, "Position should be pending");
+        assertFalse(isMature, "Position should be immature initially");
+        assertEq(remaining, 5, "Remaining blocks should be 5");
+        assertEq(liq, 1000, "Liquidity should match deposit");
+        assertEq(owner, alice, "Owner should be Alice");
+    }
+
+    function test_activateLiquidity_RevertsBeforeMaturity() public {
+        MockERC20 token0 = new MockERC20();
+        MockERC20 token1 = new MockERC20();
+        address alice = address(0xAA);
+
+        token0.mint(alice, 1000 ether);
+        token1.mint(alice, 1000 ether);
+
+        PoolKey memory key = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 3000,
+            tickSpacing: 60,
+            hooks: IHooks(address(hook))
+        });
+
+        ModifyLiquidityParams memory lpParams =
+            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+
+        vm.startPrank(alice);
+        token0.approve(address(hook), 500 ether);
+        token1.approve(address(hook), 500 ether);
+
+        bytes32 posKey = hook.depositPendingLiquidity(key, lpParams, 100 ether, 200 ether);
+        vm.stopPrank();
+
+        // Advance 2 blocks (< maturity 5)
+        vm.roll(block.number + 2);
+
+        vm.expectRevert(MRLVHook.PositionNotMature.selector);
+        hook.activateLiquidity(posKey);
+    }
+
+    function test_activateLiquidity_SucceedsAfterMaturity() public {
+        MockERC20 token0 = new MockERC20();
+        MockERC20 token1 = new MockERC20();
+        address alice = address(0xAA);
+
+        token0.mint(alice, 1000 ether);
+        token1.mint(alice, 1000 ether);
+
+        PoolKey memory key = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 3000,
+            tickSpacing: 60,
+            hooks: IHooks(address(hook))
+        });
+
+        ModifyLiquidityParams memory lpParams =
+            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+
+        vm.startPrank(alice);
+        token0.approve(address(hook), 500 ether);
+        token1.approve(address(hook), 500 ether);
+
+        bytes32 posKey = hook.depositPendingLiquidity(key, lpParams, 100 ether, 200 ether);
+        vm.stopPrank();
+
+        // Advance 5 blocks (>= maturity 5)
+        vm.roll(block.number + 5);
+
+        bool activated = hook.activateLiquidity(posKey);
+        assertTrue(activated, "Activation should succeed");
+
+        (bool isPending, bool isMature, uint256 remaining,,) = hook.getPendingPositionStatus(posKey);
+        assertFalse(isPending, "Position is no longer pending after activation");
+        assertTrue(isMature, "Position is mature");
+        assertEq(remaining, 0, "Remaining blocks should be 0");
+    }
+
+    function test_lazyActivation_OnSwap() public {
+        MockERC20 token0 = new MockERC20();
+        MockERC20 token1 = new MockERC20();
+        address alice = address(0xAA);
+
+        token0.mint(alice, 1000 ether);
+        token1.mint(alice, 1000 ether);
+
+        PoolKey memory key = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 3000,
+            tickSpacing: 60,
+            hooks: IHooks(address(hook))
+        });
+
+        ModifyLiquidityParams memory lpParams =
+            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+
+        vm.startPrank(alice);
+        token0.approve(address(hook), 500 ether);
+        token1.approve(address(hook), 500 ether);
+
+        bytes32 posKey = hook.depositPendingLiquidity(key, lpParams, 100 ether, 200 ether);
+        vm.stopPrank();
+
+        // Advance 6 blocks (mature)
+        vm.roll(block.number + 6);
+
+        // Perform swap
+        SwapParams memory params =
+            SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
+        vm.prank(poolManagerAddr);
+        hook.beforeSwap(address(0xBB), key, params, "");
+
+        // Verify lazy activation executed automatically during beforeSwap
+        (bool isPending, bool isMature,,,)= hook.getPendingPositionStatus(posKey);
+        assertFalse(isPending, "Lazy activation should activate mature position on swap");
+        assertTrue(isMature, "Position should be mature");
+    }
+
+    function test_withdrawPendingLiquidity_ReturnsEscrowedTokens() public {
+        MockERC20 token0 = new MockERC20();
+        MockERC20 token1 = new MockERC20();
+        address alice = address(0xAA);
+
+        token0.mint(alice, 1000 ether);
+        token1.mint(alice, 1000 ether);
+
+        PoolKey memory key = PoolKey({
+            currency0: Currency.wrap(address(token0)),
+            currency1: Currency.wrap(address(token1)),
+            fee: 3000,
+            tickSpacing: 60,
+            hooks: IHooks(address(hook))
+        });
+
+        ModifyLiquidityParams memory lpParams =
+            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+
+        vm.startPrank(alice);
+        token0.approve(address(hook), 500 ether);
+        token1.approve(address(hook), 500 ether);
+
+        bytes32 posKey = hook.depositPendingLiquidity(key, lpParams, 100 ether, 200 ether);
+
+        // Withdraw before maturity
+        bool withdrawn = hook.withdrawPendingLiquidity(posKey, key);
+        vm.stopPrank();
+
+        assertTrue(withdrawn, "Withdrawal should succeed");
+        assertEq(token0.balanceOf(alice), 1000 ether, "Alice should receive 100% token0 back");
+        assertEq(token1.balanceOf(alice), 1000 ether, "Alice should receive 100% token1 back");
+        assertEq(token0.balanceOf(address(hook)), 0, "Hook should have 0 token0 left");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     //                    HELPERS
     // ═══════════════════════════════════════════════════════════════════
 
@@ -513,5 +703,40 @@ contract MRLVHookTest is Test {
             tickSpacing: 60,
             hooks: IHooks(address(hook))
         });
+    }
+}
+
+contract MockERC20 {
+    string public name = "Mock Token";
+    string public symbol = "MCK";
+    uint8 public decimals = 18;
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        require(balanceOf[msg.sender] >= amount, "Insufficient balance");
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        require(balanceOf[from] >= amount, "Insufficient balance");
+        if (allowance[from][msg.sender] != type(uint256).max) {
+            require(allowance[from][msg.sender] >= amount, "Insufficient allowance");
+            allowance[from][msg.sender] -= amount;
+        }
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
     }
 }

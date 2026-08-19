@@ -9,11 +9,19 @@ import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
 import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 
 import {MEVDetector} from "./MEVDetector.sol";
 import {DynamicFeeManager} from "./DynamicFeeManager.sol";
 import {AnalyticsEmitter} from "./AnalyticsEmitter.sol";
+
+interface IERC20 {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
 
 /// @title MRLVHook
 /// @notice MEV-Redistributive Liquidity Vault — thin dispatcher hook for Uniswap v4.
@@ -28,6 +36,27 @@ contract MRLVHook is BaseHook {
     /// @notice Legacy error retained for ABI compatibility.
     /// @dev Immature liquidity does not block ordinary swaps. It is excluded from JIT/MEV analysis until mature.
     error ImmatureLiquidityExists();
+    error PositionNotMature();
+    error PositionAlreadyActivated();
+    error PositionAlreadyWithdrawn();
+    error PositionNotFound();
+    error NotPositionOwner();
+    error ZeroLiquidity();
+
+    // ─── Structs ─────────────────────────────────────────────────────
+    struct PendingPosition {
+        bytes32 posKey;
+        address owner;
+        bytes32 poolId;
+        int24 tickLower;
+        int24 tickUpper;
+        uint128 liquidity;
+        uint256 amount0;
+        uint256 amount1;
+        uint32 blockNumber;
+        bool activated;
+        bool withdrawn;
+    }
 
     // ─── State variables (per Architecture.md §3.2) ──────────────────
     MEVDetector public detector;
@@ -35,6 +64,11 @@ contract MRLVHook is BaseHook {
     AnalyticsEmitter public analytics;
     address public governance;
     bool public paused; // circuit breaker, governance-controlled
+
+    mapping(bytes32 => PendingPosition) public pendingPositions;
+    mapping(bytes32 => bytes32[]) public poolPendingPosKeys;
+    mapping(bytes32 => PoolKey) public poolKeys;
+    uint256 public pendingNonce;
 
     // ─── Per-swap context stored transiently for afterSwap ───────────
     struct SwapContext {
@@ -45,17 +79,38 @@ contract MRLVHook is BaseHook {
         uint24 appliedFee;
     }
 
-    // Using transient storage for swap context to avoid persistent writes on every swap.
-    // Key: keccak256(abi.encode("SWAP_CTX", poolId, block.number, msg.sender))
-    // But since afterSwap is called in the same tx, we use a simple storage variable
-    // that gets overwritten each swap (never read across txs). This is cheaper than
-    // re-encoding to transient storage for a struct.
     mapping(bytes32 => SwapContext) public _swapContext;
 
     // ─── Events ──────────────────────────────────────────────────────
     event Paused(address indexed by);
     event Unpaused(address indexed by);
     event GovernanceTransferred(address indexed oldGov, address indexed newGov);
+
+    event LiquidityPending(
+        bytes32 indexed posKey,
+        bytes32 indexed poolId,
+        address indexed owner,
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 liquidity,
+        uint256 amount0,
+        uint256 amount1
+    );
+
+    event LiquidityActivated(
+        bytes32 indexed posKey,
+        bytes32 indexed poolId,
+        address indexed owner,
+        uint128 liquidity
+    );
+
+    event LiquidityWithdrawnPending(
+        bytes32 indexed posKey,
+        bytes32 indexed poolId,
+        address indexed owner,
+        uint256 amount0,
+        uint256 amount1
+    );
 
     // ─── Modifiers ───────────────────────────────────────────────────
     modifier onlyGovernance() {
@@ -161,6 +216,9 @@ contract MRLVHook is BaseHook {
         }
 
         bytes32 poolId = PoolId.unwrap(key.toId());
+        poolKeys[poolId] = key;
+
+        _autoActivateMaturePositions(poolId);
 
         // 1. Score swap via MEVDetector
         uint256 riskScore = detector.scoreSwap(key, params, sender, hookData);
@@ -229,6 +287,9 @@ contract MRLVHook is BaseHook {
         ModifyLiquidityParams calldata params,
         bytes calldata hookData
     ) internal override returns (bytes4) {
+        bytes32 poolId = PoolId.unwrap(key.toId());
+        poolKeys[poolId] = key;
+
         // Set JIT flag in MEVDetector's transient storage
         detector.onBeforeAddLiquidity(key, params, sender, hookData);
 
@@ -271,5 +332,154 @@ contract MRLVHook is BaseHook {
     ) internal override returns (bytes4, BalanceDelta) {
         // TODO(Phase 2): Settle pending claimable delta, update LoyaltyManager state
         return (this.afterRemoveLiquidity.selector, delta);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //                   PENDING LIQUIDITY ESCROW & MATURITY
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// @notice Deposits LP liquidity into hook escrow without crediting active pool liquidity yet.
+    function depositPendingLiquidity(
+        PoolKey calldata key,
+        ModifyLiquidityParams calldata params,
+        uint256 amount0,
+        uint256 amount1
+    ) external returns (bytes32 posKey) {
+        if (params.liquidityDelta <= 0) revert ZeroLiquidity();
+        bytes32 poolId = PoolId.unwrap(key.toId());
+        poolKeys[poolId] = key;
+        uint128 liquidity = uint128(uint256(params.liquidityDelta));
+
+        posKey = keccak256(
+            abi.encode(poolId, msg.sender, params.tickLower, params.tickUpper, block.number, ++pendingNonce)
+        );
+
+        pendingPositions[posKey] = PendingPosition({
+            posKey: posKey,
+            owner: msg.sender,
+            poolId: poolId,
+            tickLower: params.tickLower,
+            tickUpper: params.tickUpper,
+            liquidity: liquidity,
+            amount0: amount0,
+            amount1: amount1,
+            blockNumber: uint32(block.number),
+            activated: false,
+            withdrawn: false
+        });
+
+        poolPendingPosKeys[poolId].push(posKey);
+
+        address c0 = Currency.unwrap(key.currency0);
+        address c1 = Currency.unwrap(key.currency1);
+
+        if (amount0 > 0 && c0 != address(0)) {
+            IERC20(c0).transferFrom(msg.sender, address(this), amount0);
+        }
+        if (amount1 > 0 && c1 != address(0)) {
+            IERC20(c1).transferFrom(msg.sender, address(this), amount1);
+        }
+
+        emit LiquidityPending(
+            posKey, poolId, msg.sender, params.tickLower, params.tickUpper, liquidity, amount0, amount1
+        );
+    }
+
+    /// @notice Activates a matured pending position, registering it with MEVDetector.
+    function activateLiquidity(bytes32 posKey) public returns (bool) {
+        PendingPosition storage pos = pendingPositions[posKey];
+        if (pos.owner == address(0)) revert PositionNotFound();
+        if (pos.activated) revert PositionAlreadyActivated();
+        if (pos.withdrawn) revert PositionAlreadyWithdrawn();
+
+        uint32 maturityBlocks = detector.liquidityMaturityBlocks();
+        if (block.number - pos.blockNumber < maturityBlocks) revert PositionNotMature();
+
+        return _activatePosition(posKey);
+    }
+
+    /// @notice Internal helper for lazy auto-activating mature pending positions during swaps.
+    function _autoActivateMaturePositions(bytes32 poolId) internal {
+        bytes32[] storage keys = poolPendingPosKeys[poolId];
+        uint32 maturityBlocks = detector.liquidityMaturityBlocks();
+        uint256 len = keys.length;
+        for (uint256 i = 0; i < len; i++) {
+            bytes32 pKey = keys[i];
+            PendingPosition storage pos = pendingPositions[pKey];
+            if (!pos.activated && !pos.withdrawn && block.number - pos.blockNumber >= maturityBlocks) {
+                _activatePosition(pKey);
+            }
+        }
+    }
+
+    /// @notice Internal activation helper.
+    function _activatePosition(bytes32 posKey) internal returns (bool) {
+        PendingPosition storage pos = pendingPositions[posKey];
+        pos.activated = true;
+
+        PoolKey memory key = poolKeys[pos.poolId];
+
+        detector.onBeforeAddLiquidity(
+            key,
+            ModifyLiquidityParams({
+                tickLower: pos.tickLower,
+                tickUpper: pos.tickUpper,
+                liquidityDelta: int256(uint256(pos.liquidity)),
+                salt: 0
+            }),
+            pos.owner,
+            ""
+        );
+
+        emit LiquidityActivated(posKey, pos.poolId, pos.owner, pos.liquidity);
+        return true;
+    }
+
+    /// @notice Withdraws a pending position that has not yet been activated, returning exact escrowed tokens.
+    function withdrawPendingLiquidity(bytes32 posKey, PoolKey calldata key) external returns (bool) {
+        PendingPosition storage pos = pendingPositions[posKey];
+        if (pos.owner == address(0)) revert PositionNotFound();
+        if (msg.sender != pos.owner) revert NotPositionOwner();
+        if (pos.activated) revert PositionAlreadyActivated();
+        if (pos.withdrawn) revert PositionAlreadyWithdrawn();
+
+        pos.withdrawn = true;
+
+        address c0 = Currency.unwrap(key.currency0);
+        address c1 = Currency.unwrap(key.currency1);
+
+        if (pos.amount0 > 0 && c0 != address(0)) {
+            IERC20(c0).transfer(pos.owner, pos.amount0);
+        }
+        if (pos.amount1 > 0 && c1 != address(0)) {
+            IERC20(c1).transfer(pos.owner, pos.amount1);
+        }
+
+        emit LiquidityWithdrawnPending(posKey, pos.poolId, pos.owner, pos.amount0, pos.amount1);
+        return true;
+    }
+
+    /// @notice Views a position's maturity status and remaining blocks until maturity.
+    function getPendingPositionStatus(bytes32 posKey)
+        external
+        view
+        returns (
+            bool isPending,
+            bool isMature,
+            uint256 remainingBlocks,
+            uint128 liquidity,
+            address owner
+        )
+    {
+        PendingPosition memory pos = pendingPositions[posKey];
+        if (pos.owner == address(0)) revert PositionNotFound();
+
+        isPending = !pos.activated && !pos.withdrawn;
+        uint32 maturityBlocks = detector.liquidityMaturityBlocks();
+        uint256 age = block.number - pos.blockNumber;
+        isMature = age >= maturityBlocks;
+        remainingBlocks = isMature ? 0 : (maturityBlocks - age);
+        liquidity = pos.liquidity;
+        owner = pos.owner;
     }
 }
