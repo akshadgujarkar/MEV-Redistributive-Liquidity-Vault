@@ -15,13 +15,13 @@ import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/Pool
 import {MEVDetector} from "./MEVDetector.sol";
 import {DynamicFeeManager} from "./DynamicFeeManager.sol";
 import {AnalyticsEmitter} from "./AnalyticsEmitter.sol";
-
-interface IERC20 {
-    function transfer(address to, uint256 amount) external returns (bool);
-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
-    function approve(address spender, uint256 amount) external returns (bool);
-    function balanceOf(address account) external view returns (uint256);
-}
+import {IERC20} from "../lib/forge-std/src/interfaces/IERC20.sol";
+// interface IERC20 {
+//     function transfer(address to, uint256 amount) external returns (bool);
+//     function transferFrom(address from, address to, uint256 amount) external returns (bool);
+//     function approve(address spender, uint256 amount) external returns (bool);
+//     function balanceOf(address account) external view returns (uint256);
+// }
 
 /// @title MRLVHook
 /// @notice MEV-Redistributive Liquidity Vault — thin dispatcher hook for Uniswap v4.
@@ -282,16 +282,13 @@ contract MRLVHook is BaseHook {
 
     // ─── beforeAddLiquidity ──────────────────────────────────────────
     function _beforeAddLiquidity(
-        address sender,
+        address,
         PoolKey calldata key,
-        ModifyLiquidityParams calldata params,
-        bytes calldata hookData
+        ModifyLiquidityParams calldata,
+        bytes calldata
     ) internal override returns (bytes4) {
         bytes32 poolId = PoolId.unwrap(key.toId());
         poolKeys[poolId] = key;
-
-        // Set JIT flag in MEVDetector's transient storage
-        detector.onBeforeAddLiquidity(key, params, sender, hookData);
 
         // TODO(Phase 2): Call LoyaltyManager.onAddLiquidity() to start/continue tenure
         return this.beforeAddLiquidity.selector;
@@ -312,12 +309,11 @@ contract MRLVHook is BaseHook {
 
     // ─── beforeRemoveLiquidity ───────────────────────────────────────
     function _beforeRemoveLiquidity(
-        address sender,
-        PoolKey calldata key,
-        ModifyLiquidityParams calldata params,
+        address,
+        PoolKey calldata,
+        ModifyLiquidityParams calldata,
         bytes calldata
     ) internal override returns (bytes4) {
-        detector.onBeforeRemoveLiquidity(key, params, sender);
         return this.beforeRemoveLiquidity.selector;
     }
 
@@ -385,7 +381,7 @@ contract MRLVHook is BaseHook {
         );
     }
 
-    /// @notice Activates a matured pending position, registering it with MEVDetector.
+    /// @notice Activates a matured pending position.
     function activateLiquidity(bytes32 posKey) public returns (bool) {
         PendingPosition storage pos = pendingPositions[posKey];
         if (pos.owner == address(0)) revert PositionNotFound();
@@ -416,20 +412,6 @@ contract MRLVHook is BaseHook {
     function _activatePosition(bytes32 posKey) internal returns (bool) {
         PendingPosition storage pos = pendingPositions[posKey];
         pos.activated = true;
-
-        PoolKey memory key = poolKeys[pos.poolId];
-
-        detector.onBeforeAddLiquidity(
-            key,
-            ModifyLiquidityParams({
-                tickLower: pos.tickLower,
-                tickUpper: pos.tickUpper,
-                liquidityDelta: int256(uint256(pos.liquidity)),
-                salt: 0
-            }),
-            pos.owner,
-            ""
-        );
 
         emit LiquidityActivated(posKey, pos.poolId, pos.owner, pos.liquidity);
         return true;
