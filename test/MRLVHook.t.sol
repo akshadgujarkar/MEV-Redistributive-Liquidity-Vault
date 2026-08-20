@@ -19,19 +19,45 @@ import {DynamicFeeManager} from "../src/DynamicFeeManager.sol";
 import {AnalyticsEmitter} from "../src/AnalyticsEmitter.sol";
 import {ImmutableState} from "@uniswap/v4-periphery/src/base/ImmutableState.sol";
 
+contract MockPoolManager {
+    bool public unlocked;
+
+    function modifyLiquidity(
+        PoolKey memory,
+        ModifyLiquidityParams memory,
+        bytes calldata
+    ) external returns (BalanceDelta callerDelta, BalanceDelta feesAccrued) {
+        return (BalanceDelta.wrap(0), BalanceDelta.wrap(0));
+    }
+
+    function unlock(bytes calldata data) external returns (bytes memory) {
+        unlocked = true;
+        bytes memory result = MRLVHook(payable(msg.sender)).unlockCallback(data);
+        unlocked = false;
+        return result;
+    }
+
+    function sync(Currency) external {}
+    function settle() external payable returns (uint256) { return 0; }
+    function take(Currency, address, uint256) external {}
+}
+
 contract MRLVHookTest is Test {
     MRLVHook public hook;
     MEVDetector public detector;
     DynamicFeeManager public feeManager;
     AnalyticsEmitter public analytics;
+    MockPoolManager public mockPoolManager;
 
     address public governance = address(0xBEEF);
     address public oracleRelayer = address(0xCEEF);
-    address public poolManagerAddr = address(0x1234);
+    address public poolManagerAddr;
     address public unauthorized = address(0xDEAD);
 
     function setUp() public {
-        // Mine a valid hook address using HookMiner
+        mockPoolManager = new MockPoolManager();
+        poolManagerAddr = address(mockPoolManager);
+
         uint160 flags = uint160(
             Hooks.BEFORE_INITIALIZE_FLAG |
             Hooks.AFTER_INITIALIZE_FLAG |
@@ -43,13 +69,10 @@ contract MRLVHookTest is Test {
             Hooks.AFTER_SWAP_FLAG
         );
 
-        // Deploy helper contracts with a temporary hook placeholder
-        // (will be replaced with the mined address)
         detector = new MEVDetector(governance, address(this), oracleRelayer);
         feeManager = new DynamicFeeManager(governance, address(this));
         analytics = new AnalyticsEmitter(governance);
 
-        // Mine CREATE2 salt for hook deployment
         bytes memory constructorArgs = abi.encode(
             IPoolManager(poolManagerAddr),
             detector,
@@ -64,7 +87,6 @@ contract MRLVHookTest is Test {
             constructorArgs
         );
 
-        // Deploy hook at the mined address
         hook = new MRLVHook{salt: salt}(
             IPoolManager(poolManagerAddr),
             detector,
@@ -74,7 +96,6 @@ contract MRLVHookTest is Test {
         );
         require(address(hook) == hookAddr, "Hook address mismatch");
 
-        // Update detector and feeManager to point to the actual hook address
         vm.startPrank(governance);
         detector.setHook(address(hook));
         feeManager.setHook(address(hook));
@@ -190,8 +211,7 @@ contract MRLVHookTest is Test {
         PoolKey memory key = _makePoolKey();
         SwapParams memory params = SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
 
-        // hookData with length 1-31 (not empty, not valid ABI chunk)
-        bytes memory badData = hex"DEADBEEF"; // 4 bytes
+        bytes memory badData = hex"DEADBEEF";
 
         vm.prank(poolManagerAddr);
         vm.expectRevert(MRLVHook.InvalidHookData.selector);
@@ -230,7 +250,6 @@ contract MRLVHookTest is Test {
         (bytes4 selector_, , uint24 feeOverride) = hook.beforeSwap(address(this), key, params, "");
 
         assertEq(selector_, hook.beforeSwap.selector);
-        // Fee should be BASE_FEE | OVERRIDE_FEE_FLAG
         uint24 expectedFee = LPFeeLibrary.OVERRIDE_FEE_FLAG | feeManager.BASE_FEE();
         assertEq(feeOverride, expectedFee, "Paused hook should return base fee");
     }
@@ -247,150 +266,38 @@ contract MRLVHookTest is Test {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    //              LIQUIDITY MATURATION GATE (5-block rule)
+    //              LIQUIDITY MATURATION & ESCROW ENFORCEMENT
     // ═══════════════════════════════════════════════════════════════════
 
-    /// @notice beforeSwap MUST succeed even when the most-recently-added LP position is immature (< 5 blocks old).
+    function test_beforeAddLiquidity_revertsForDirectAddWithoutEscrow() public {
+        PoolKey memory key = _makePoolKey();
+        ModifyLiquidityParams memory lpParams =
+            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
+
+        vm.prank(poolManagerAddr);
+        vm.expectRevert(MRLVHook.PositionNotMature.selector);
+        hook.beforeAddLiquidity(address(0xAA), key, lpParams, "");
+    }
+
     function test_beforeSwap_succeedsWithImmatureLiquidity() public {
         PoolKey memory key = _makePoolKey();
-        ModifyLiquidityParams memory lpParams =
-            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
         SwapParams memory params =
             SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
 
-        // LP adds liquidity via the hook (poolManager calls beforeAddLiquidity)
-        vm.prank(poolManagerAddr);
-        hook.beforeAddLiquidity(address(0xAA), key, lpParams, "");
-
-        // Advance 2 blocks — LP is still immature (age=2 < maturityBlocks=5)
-        vm.roll(block.number + 2);
-
-        // Normal trader swap attempt MUST succeed
         vm.prank(poolManagerAddr);
         (bytes4 selector_,,) = hook.beforeSwap(address(0xBB), key, params, "");
-        assertEq(selector_, hook.beforeSwap.selector, "beforeSwap with immature liquidity should succeed");
+        assertEq(selector_, hook.beforeSwap.selector, "beforeSwap should succeed");
     }
 
-    /// @notice beforeSwap must succeed once the LP position has matured (>= 5 blocks).
-    function test_beforeSwap_succeedsWithMatureLiquidity() public {
-        PoolKey memory key = _makePoolKey();
-        ModifyLiquidityParams memory lpParams =
-            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
-        SwapParams memory params =
-            SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
-
-        // LP adds liquidity
-        vm.prank(poolManagerAddr);
-        hook.beforeAddLiquidity(address(0xAA), key, lpParams, "");
-
-        // Advance exactly 5 blocks — LP is now mature (block.number >= addedBlock + 5)
-        vm.roll(block.number + 5);
-
-        // Swap must succeed (no revert)
-        vm.prank(poolManagerAddr);
-        (bytes4 selector_,,) = hook.beforeSwap(address(0xBB), key, params, "");
-        assertEq(selector_, hook.beforeSwap.selector, "beforeSwap should return its selector");
-    }
-
-    /// @notice beforeSwap must succeed when no LP has ever added to the pool.
-    ///         The maturation gate is a no-op when lastPoolLP is address(0).
     function test_beforeSwap_noLiquidity_succeeds() public {
         PoolKey memory key = _makePoolKey();
         SwapParams memory params =
             SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
 
-        // No prior LP addition — gate is inactive
         vm.prank(poolManagerAddr);
         (bytes4 selector_,,) = hook.beforeSwap(address(0xCC), key, params, "");
         assertEq(selector_, hook.beforeSwap.selector, "beforeSwap with no LP should succeed");
     }
-
-    // ═══════════════════════════════════════════════════════════════════
-    //                     SPECIFIC SCENARIO TESTS
-    // ═══════════════════════════════════════════════════════════════════
-
-    /// @notice Scenario 1 — Single LP addition followed by swap:
-    ///         Alice adds at 100, Bob swaps at 102.
-    ///         Bob's swap MUST succeed with normal risk score of 0.
-    function test_Scenario1_OneImmatureLP() public {
-        vm.roll(100);
-        PoolKey memory key = _makePoolKey();
-        bytes32 poolId = PoolId.unwrap(key.toId());
-        ModifyLiquidityParams memory lpParams =
-            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
-        SwapParams memory params =
-            SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
-
-        address alice = address(0xAA);
-        address bob = address(0xBB);
-
-        // Block 100: Alice adds liquidity
-        vm.prank(poolManagerAddr);
-        hook.beforeAddLiquidity(alice, key, lpParams, "");
-
-        // Block 102: Bob swaps
-        vm.roll(102);
-
-        vm.prank(poolManagerAddr);
-        (bytes4 selector_,,) = hook.beforeSwap(bob, key, params, "");
-        assertEq(selector_, hook.beforeSwap.selector, "Bob's swap must succeed");
-
-        // Verify risk score stored in swap context
-        bytes32 ctxKey = keccak256(abi.encode("SWAP_CTX", poolId, 102, bob));
-        (,,, uint256 riskScore,) = hook._swapContext(ctxKey);
-        assertEq(riskScore, 0, "Normal swap must produce 0 risk score");
-    }
-
-    /// @notice Scenario 2 — Continuous LP additions:
-    ///         Block 100 Alice, 101 Bob, 102 Charlie, 103 Dave swaps, 104 Eve, 105 Frank swaps.
-    ///         Normal swaps MUST NOT be blocked.
-    function test_Scenario2_ContinuousLPAdditions() public {
-        PoolKey memory key = _makePoolKey();
-        ModifyLiquidityParams memory lpParams =
-            ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1000, salt: 0});
-        SwapParams memory params =
-            SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: 0});
-
-        address alice = address(0xAA);
-        address bob = address(0xBB);
-        address charlie = address(0xCC);
-        address dave = address(0xDD);
-        address eve = address(0xEE);
-        address frank = address(0xFF);
-
-        // Block 100: Alice adds liquidity
-        vm.roll(100);
-        vm.prank(poolManagerAddr);
-        hook.beforeAddLiquidity(alice, key, lpParams, "");
-
-        // Block 101: Bob adds liquidity
-        vm.roll(101);
-        vm.prank(poolManagerAddr);
-        hook.beforeAddLiquidity(bob, key, lpParams, "");
-
-        // Block 102: Charlie adds liquidity
-        vm.roll(102);
-        vm.prank(poolManagerAddr);
-        hook.beforeAddLiquidity(charlie, key, lpParams, "");
-
-        // Block 103: Dave swaps (must succeed)
-        vm.roll(103);
-        vm.prank(poolManagerAddr);
-        (bytes4 sel1,,) = hook.beforeSwap(dave, key, params, "");
-        assertEq(sel1, hook.beforeSwap.selector, "Dave swap must succeed");
-
-        // Block 104: Eve adds liquidity
-        vm.roll(104);
-        vm.prank(poolManagerAddr);
-        hook.beforeAddLiquidity(eve, key, lpParams, "");
-
-        // Block 105: Frank swaps (must succeed)
-        vm.roll(105);
-        vm.prank(poolManagerAddr);
-        (bytes4 sel2,,) = hook.beforeSwap(frank, key, params, "");
-        assertEq(sel2, hook.beforeSwap.selector, "Frank swap must succeed");
-    }
-
 
     // ═══════════════════════════════════════════════════════════════════
     //             PENDING LIQUIDITY ESCROW & MATURITY TESTS

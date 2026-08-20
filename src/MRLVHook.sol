@@ -11,24 +11,19 @@ import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "@uniswap/v4-core/src/type
 import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 
 import {MEVDetector} from "./MEVDetector.sol";
 import {DynamicFeeManager} from "./DynamicFeeManager.sol";
 import {AnalyticsEmitter} from "./AnalyticsEmitter.sol";
 import {IERC20} from "../lib/forge-std/src/interfaces/IERC20.sol";
-// interface IERC20 {
-//     function transfer(address to, uint256 amount) external returns (bool);
-//     function transferFrom(address from, address to, uint256 amount) external returns (bool);
-//     function approve(address spender, uint256 amount) external returns (bool);
-//     function balanceOf(address account) external view returns (uint256);
-// }
 
 /// @title MRLVHook
 /// @notice MEV-Redistributive Liquidity Vault — thin dispatcher hook for Uniswap v4.
 ///         Delegates MEV detection to MEVDetector, fee calculation to DynamicFeeManager,
 ///         and analytics emission to AnalyticsEmitter.
 ///         Phase 2 modules (RewardVault, LoyaltyManager) are referenced via TODO stubs.
-contract MRLVHook is BaseHook {
+contract MRLVHook is BaseHook, IUnlockCallback {
     // ─── Custom errors ───────────────────────────────────────────────
     error NotGovernance();
     error HookIsPaused();
@@ -64,6 +59,7 @@ contract MRLVHook is BaseHook {
     AnalyticsEmitter public analytics;
     address public governance;
     bool public paused; // circuit breaker, governance-controlled
+    bool private _isActivating; // transient lock for internal position activation
 
     mapping(bytes32 => PendingPosition) public pendingPositions;
     mapping(bytes32 => bytes32[]) public poolPendingPosKeys;
@@ -132,6 +128,8 @@ contract MRLVHook is BaseHook {
         governance = _governance;
     }
 
+    receive() external payable {}
+
     // ─── Hook permissions ────────────────────────────────────────────
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
@@ -178,8 +176,6 @@ contract MRLVHook is BaseHook {
         override
         returns (bytes4)
     {
-        // Pool validation — v4 ensures PoolKey.hooks == address(this) via address convention.
-        // No additional validation needed for Phase 1.
         return this.beforeInitialize.selector;
     }
 
@@ -189,7 +185,6 @@ contract MRLVHook is BaseHook {
         override
         returns (bytes4)
     {
-        // TODO(Phase 2): Initialize LoyaltyManager state for this pool if needed.
         return this.afterInitialize.selector;
     }
 
@@ -200,13 +195,10 @@ contract MRLVHook is BaseHook {
         SwapParams calldata params,
         bytes calldata hookData
     ) internal override returns (bytes4, BeforeSwapDelta, uint24) {
-        // Validate hookData: if provided, must be valid ABI-encoded bytes.
-        // Empty hookData is acceptable for Phase 1 (no hookData needed).
         if (hookData.length > 0 && hookData.length < 32) {
             revert InvalidHookData();
         }
 
-        // If paused, pass through with base fee — no detection
         if (paused) {
             return (
                 this.beforeSwap.selector,
@@ -220,13 +212,9 @@ contract MRLVHook is BaseHook {
 
         _autoActivateMaturePositions(poolId);
 
-        // 1. Score swap via MEVDetector
         uint256 riskScore = detector.scoreSwap(key, params, sender, hookData);
-
-        // 2. Compute rate-limited fee via DynamicFeeManager
         uint24 appliedFee = feeManager.computeFee(poolId, riskScore);
 
-        // 3. Store swap context for afterSwap
         bytes32 ctxKey = keccak256(abi.encode("SWAP_CTX", poolId, block.number, sender));
         _swapContext[ctxKey] = SwapContext({
             trader: sender,
@@ -236,7 +224,6 @@ contract MRLVHook is BaseHook {
             appliedFee: appliedFee
         });
 
-        // Return fee override with the OVERRIDE_FEE_FLAG
         return (
             this.beforeSwap.selector,
             BeforeSwapDeltaLibrary.ZERO_DELTA,
@@ -260,7 +247,6 @@ contract MRLVHook is BaseHook {
         bytes32 ctxKey = keccak256(abi.encode("SWAP_CTX", poolId, block.number, sender));
         SwapContext memory ctx = _swapContext[ctxKey];
 
-        // Emit analytics events
         analytics.emitSwapProcessed(poolId, ctx.trader, ctx.appliedFee, ctx.riskScore);
 
         if (ctx.riskScore >= 30) {
@@ -269,12 +255,7 @@ contract MRLVHook is BaseHook {
                 : 0;
             analytics.emitMEVDetected(poolId, ctx.trader, ctx.riskScore, surcharge);
         }
-    
-        // TODO(Phase 2): Compute surcharge amount from (appliedFee - BASE_FEE) * notional
-        //                 and call RewardVault.deposit(poolId, surchargeAmount)
-        // TODO(Phase 2): Call LoyaltyManager to update per-swap stats
 
-        // Clean up swap context (gas refund on SSTORE to zero)
         delete _swapContext[ctxKey];
 
         return (this.afterSwap.selector, 0);
@@ -290,7 +271,11 @@ contract MRLVHook is BaseHook {
         bytes32 poolId = PoolId.unwrap(key.toId());
         poolKeys[poolId] = key;
 
-        // TODO(Phase 2): Call LoyaltyManager.onAddLiquidity() to start/continue tenure
+        // Enforce Liquidity Escrow: Direct liquidity additions that bypass pending escrow are rejected.
+        if (!_isActivating) {
+            revert PositionNotMature();
+        }
+
         return this.beforeAddLiquidity.selector;
     }
 
@@ -303,7 +288,6 @@ contract MRLVHook is BaseHook {
         BalanceDelta,
         bytes calldata
     ) internal override returns (bytes4, BalanceDelta) {
-        // TODO(Phase 2): Recompute LPScore and update tier (may trigger NFT mint)
         return (this.afterAddLiquidity.selector, delta);
     }
 
@@ -326,7 +310,6 @@ contract MRLVHook is BaseHook {
         BalanceDelta,
         bytes calldata
     ) internal override returns (bytes4, BalanceDelta) {
-        // TODO(Phase 2): Settle pending claimable delta, update LoyaltyManager state
         return (this.afterRemoveLiquidity.selector, delta);
     }
 
@@ -382,6 +365,7 @@ contract MRLVHook is BaseHook {
     }
 
     /// @notice Activates a matured pending position.
+    ///         Can only be invoked when liquidity has reached the maturity block level.
     function activateLiquidity(bytes32 posKey) public returns (bool) {
         PendingPosition storage pos = pendingPositions[posKey];
         if (pos.owner == address(0)) revert PositionNotFound();
@@ -391,7 +375,15 @@ contract MRLVHook is BaseHook {
         uint32 maturityBlocks = detector.liquidityMaturityBlocks();
         if (block.number - pos.blockNumber < maturityBlocks) revert PositionNotMature();
 
-        return _activatePosition(posKey);
+        poolManager.unlock(abi.encode(posKey));
+        return true;
+    }
+
+    /// @notice Callback for PoolManager unlock to execute position activation.
+    function unlockCallback(bytes calldata data) external override onlyPoolManager returns (bytes memory) {
+        bytes32 posKey = abi.decode(data, (bytes32));
+        _activatePosition(posKey);
+        return "";
     }
 
     /// @notice Internal helper for lazy auto-activating mature pending positions during swaps.
@@ -411,7 +403,76 @@ contract MRLVHook is BaseHook {
     /// @notice Internal activation helper.
     function _activatePosition(bytes32 posKey) internal returns (bool) {
         PendingPosition storage pos = pendingPositions[posKey];
+        if (pos.activated) return false;
         pos.activated = true;
+
+        PoolKey memory key = poolKeys[pos.poolId];
+
+        ModifyLiquidityParams memory params = ModifyLiquidityParams({
+            tickLower: pos.tickLower,
+            tickUpper: pos.tickUpper,
+            liquidityDelta: int256(uint256(pos.liquidity)),
+            salt: 0
+        });
+
+        _isActivating = true;
+        (BalanceDelta delta, ) = poolManager.modifyLiquidity(key, params, "");
+        _isActivating = false;
+
+        int128 delta0 = delta.amount0();
+        int128 delta1 = delta.amount1();
+
+        if (delta0 < 0) {
+            uint256 amount0Owed = uint256(uint128(-delta0));
+            address c0 = Currency.unwrap(key.currency0);
+            if (c0 != address(0)) {
+                poolManager.sync(key.currency0);
+                IERC20(c0).transfer(address(poolManager), amount0Owed);
+                poolManager.settle();
+            } else {
+                poolManager.settle{value: amount0Owed}();
+            }
+            if (pos.amount0 > amount0Owed) {
+                uint256 refund0 = pos.amount0 - amount0Owed;
+                if (c0 != address(0)) {
+                    IERC20(c0).transfer(pos.owner, refund0);
+                }
+            }
+        } else if (delta0 > 0) {
+            poolManager.take(key.currency0, pos.owner, uint256(uint128(delta0)));
+            if (pos.amount0 > 0) {
+                address c0 = Currency.unwrap(key.currency0);
+                if (c0 != address(0)) {
+                    IERC20(c0).transfer(pos.owner, pos.amount0);
+                }
+            }
+        }
+
+        if (delta1 < 0) {
+            uint256 amount1Owed = uint256(uint128(-delta1));
+            address c1 = Currency.unwrap(key.currency1);
+            if (c1 != address(0)) {
+                poolManager.sync(key.currency1);
+                IERC20(c1).transfer(address(poolManager), amount1Owed);
+                poolManager.settle();
+            } else {
+                poolManager.settle{value: amount1Owed}();
+            }
+            if (pos.amount1 > amount1Owed) {
+                uint256 refund1 = pos.amount1 - amount1Owed;
+                if (c1 != address(0)) {
+                    IERC20(c1).transfer(pos.owner, refund1);
+                }
+            }
+        } else if (delta1 > 0) {
+            poolManager.take(key.currency1, pos.owner, uint256(uint128(delta1)));
+            if (pos.amount1 > 0) {
+                address c1 = Currency.unwrap(key.currency1);
+                if (c1 != address(0)) {
+                    IERC20(c1).transfer(pos.owner, pos.amount1);
+                }
+            }
+        }
 
         emit LiquidityActivated(posKey, pos.poolId, pos.owner, pos.liquidity);
         return true;
@@ -465,3 +526,4 @@ contract MRLVHook is BaseHook {
         owner = pos.owner;
     }
 }
+
