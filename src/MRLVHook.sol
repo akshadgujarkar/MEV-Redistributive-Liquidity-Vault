@@ -20,6 +20,9 @@ import {AnalyticsEmitter} from "./AnalyticsEmitter.sol";
 import {IERC20} from "lib/v4-hooks-public/lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "lib/v4-hooks-public/lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 
+import {RewardVault} from "./RewardVault.sol";
+import {LoyaltyManager} from "./LoyaltyManager.sol";
+
 /// @title MRLVHook
 /// @notice MEV-Redistributive Liquidity Vault — thin dispatcher hook for Uniswap v4.
 ///         Delegates MEV detection to MEVDetector, fee calculation to DynamicFeeManager,
@@ -63,6 +66,9 @@ contract MRLVHook is BaseHook, IUnlockCallback, ReentrancyGuard {
     address public governance;
     bool public paused; // circuit breaker, governance-controlled
     bool private _isActivating; // transient lock for internal position activation
+
+    RewardVault public rewardVault;
+    LoyaltyManager public loyaltyManager;
 
     mapping(bytes32 => PendingPosition) public pendingPositions;
     mapping(bytes32 => bytes32[]) public poolPendingPosKeys;
@@ -175,6 +181,14 @@ contract MRLVHook is BaseHook, IUnlockCallback, ReentrancyGuard {
         governance = newGovernance;
     }
 
+    function setRewardVault(RewardVault _rewardVault) external onlyGovernance {
+        rewardVault = _rewardVault;
+    }
+
+    function setLoyaltyManager(LoyaltyManager _loyaltyManager) external onlyGovernance {
+        loyaltyManager = _loyaltyManager;
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     //                       HOOK CALLBACKS
     // ═══════════════════════════════════════════════════════════════════
@@ -248,8 +262,8 @@ contract MRLVHook is BaseHook, IUnlockCallback, ReentrancyGuard {
     function _afterSwap(
         address sender,
         PoolKey calldata key,
-        SwapParams calldata,
-        BalanceDelta,
+        SwapParams calldata params,
+        BalanceDelta delta,
         bytes calldata
     ) internal override returns (bytes4, int128) {
         if (paused) {
@@ -280,6 +294,16 @@ contract MRLVHook is BaseHook, IUnlockCallback, ReentrancyGuard {
                 ctx.riskScore,
                 surcharge
             );
+
+            if (surcharge > 0 && address(rewardVault) != address(0)) {
+                uint256 notional = params.amountSpecified < 0
+                    ? uint256(-params.amountSpecified)
+                    : uint256(params.amountSpecified);
+                uint256 surchargeAmount = (notional * surcharge) / 1000000;
+                if (surchargeAmount > 0) {
+                    rewardVault.deposit(poolId, surchargeAmount);
+                }
+            }
         }
 
         delete _swapContext[ctxKey];
@@ -319,11 +343,16 @@ contract MRLVHook is BaseHook, IUnlockCallback, ReentrancyGuard {
 
     // ─── beforeRemoveLiquidity ───────────────────────────────────────
     function _beforeRemoveLiquidity(
-        address,
-        PoolKey calldata,
-        ModifyLiquidityParams calldata,
+        address sender,
+        PoolKey calldata key,
+        ModifyLiquidityParams calldata params,
         bytes calldata
     ) internal override returns (bytes4) {
+        if (address(loyaltyManager) != address(0)) {
+            bytes32 poolId = PoolId.unwrap(key.toId());
+            uint128 liquidity = uint128(uint256(-params.liquidityDelta));
+            loyaltyManager.onRemoveLiquidity(sender, liquidity, poolId);
+        }
         return this.beforeRemoveLiquidity.selector;
     }
 
@@ -530,6 +559,10 @@ contract MRLVHook is BaseHook, IUnlockCallback, ReentrancyGuard {
                     IERC20(c1).safeTransfer(pos.owner, pos.amount1);
                 }
             }
+        }
+
+        if (address(loyaltyManager) != address(0)) {
+            loyaltyManager.onAddLiquidity(pos.owner, pos.liquidity, pos.poolId);
         }
 
         emit LiquidityActivated(posKey, pos.poolId, pos.owner, pos.liquidity);
