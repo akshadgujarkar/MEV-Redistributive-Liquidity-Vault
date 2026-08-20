@@ -13,7 +13,6 @@ Stand up the on-chain foundation: a working hook wired to `PoolManager`, MEV det
 - [ ] Build `MRLVHook.sol` skeleton with all seven `IHooks` callbacks wired (even as stubs initially).
 - [ ] Implement `MEVDetector.sol`: priority-fee-anomaly signal (transient-storage/rolling-average comparison).
 - [ ] Implement `MEVDetector.sol`: same-block-reversal signal (transient storage).
-- [ ] Implement `MEVDetector.sol`: JIT-pattern signal (transient storage flag set from `beforeAddLiquidity`).
 - [ ] Implement `MEVDetector.sol`: large-price-impact signal.
 - [ ] Implement `DynamicFeeManager.sol`: tiered fee computation (0.30% / 0.60% / 1–3% linear).
 - [ ] Implement `DynamicFeeManager.sol`: hard cap (3%) and per-block rate limiting (≤3× previous fee).
