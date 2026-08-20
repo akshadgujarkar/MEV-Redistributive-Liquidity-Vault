@@ -69,15 +69,11 @@ contract LoyaltyNFT is ERC721 {
 
     // ─── Overrides to enforce soulbound (non-transferable) behaviour ───
 
-    function transferFrom(address, address, uint256) public pure override {
-        revert NonTransferable();
-    }
-
-    function safeTransferFrom(address, address, uint256) public pure override {
-        revert NonTransferable();
-    }
-
-    function safeTransferFrom(address, address, uint256, bytes memory) public pure override {
-        revert NonTransferable();
+    function _update(address to, uint256 tokenId, address auth) internal override returns (address) {
+        address from = _ownerOf(tokenId);
+        if (from != address(0) && to != address(0)) {
+            revert NonTransferable();
+        }
+        return super._update(to, tokenId, auth);
     }
 }
