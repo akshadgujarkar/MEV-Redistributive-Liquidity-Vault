@@ -12,6 +12,7 @@ import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 import {MEVDetector} from "./MEVDetector.sol";
 import {DynamicFeeManager} from "./DynamicFeeManager.sol";
@@ -23,7 +24,7 @@ import {IERC20} from "../lib/forge-std/src/interfaces/IERC20.sol";
 ///         Delegates MEV detection to MEVDetector, fee calculation to DynamicFeeManager,
 ///         and analytics emission to AnalyticsEmitter.
 ///         Phase 2 modules (RewardVault, LoyaltyManager) are referenced via TODO stubs.
-contract MRLVHook is BaseHook, IUnlockCallback {
+contract MRLVHook is BaseHook, IUnlockCallback, ReentrancyGuard {
     // ─── Custom errors ───────────────────────────────────────────────
     error NotGovernance();
     error HookIsPaused();
@@ -318,12 +319,13 @@ contract MRLVHook is BaseHook, IUnlockCallback {
     // ═══════════════════════════════════════════════════════════════════
 
     /// @notice Deposits LP liquidity into hook escrow without crediting active pool liquidity yet.
+    /// @dev Protected against reentrancy via nonReentrant and strict CEI pattern.
     function depositPendingLiquidity(
         PoolKey calldata key,
         ModifyLiquidityParams calldata params,
         uint256 amount0,
         uint256 amount1
-    ) external returns (bytes32 posKey) {
+    ) external nonReentrant returns (bytes32 posKey) {
         if (params.liquidityDelta <= 0) revert ZeroLiquidity();
         bytes32 poolId = PoolId.unwrap(key.toId());
         poolKeys[poolId] = key;
@@ -349,6 +351,10 @@ contract MRLVHook is BaseHook, IUnlockCallback {
 
         poolPendingPosKeys[poolId].push(posKey);
 
+        emit LiquidityPending(
+            posKey, poolId, msg.sender, params.tickLower, params.tickUpper, liquidity, amount0, amount1
+        );
+
         address c0 = Currency.unwrap(key.currency0);
         address c1 = Currency.unwrap(key.currency1);
 
@@ -358,15 +364,11 @@ contract MRLVHook is BaseHook, IUnlockCallback {
         if (amount1 > 0 && c1 != address(0)) {
             IERC20(c1).transferFrom(msg.sender, address(this), amount1);
         }
-
-        emit LiquidityPending(
-            posKey, poolId, msg.sender, params.tickLower, params.tickUpper, liquidity, amount0, amount1
-        );
     }
 
     /// @notice Activates a matured pending position.
     ///         Can only be invoked when liquidity has reached the maturity block level.
-    function activateLiquidity(bytes32 posKey) public returns (bool) {
+    function activateLiquidity(bytes32 posKey) public nonReentrant returns (bool) {
         PendingPosition storage pos = pendingPositions[posKey];
         if (pos.owner == address(0)) revert PositionNotFound();
         if (pos.activated) revert PositionAlreadyActivated();
@@ -479,7 +481,7 @@ contract MRLVHook is BaseHook, IUnlockCallback {
     }
 
     /// @notice Withdraws a pending position that has not yet been activated, returning exact escrowed tokens.
-    function withdrawPendingLiquidity(bytes32 posKey, PoolKey calldata key) external returns (bool) {
+    function withdrawPendingLiquidity(bytes32 posKey, PoolKey calldata key) external nonReentrant returns (bool) {
         PendingPosition storage pos = pendingPositions[posKey];
         if (pos.owner == address(0)) revert PositionNotFound();
         if (msg.sender != pos.owner) revert NotPositionOwner();
@@ -487,6 +489,8 @@ contract MRLVHook is BaseHook, IUnlockCallback {
         if (pos.withdrawn) revert PositionAlreadyWithdrawn();
 
         pos.withdrawn = true;
+
+        emit LiquidityWithdrawnPending(posKey, pos.poolId, pos.owner, pos.amount0, pos.amount1);
 
         address c0 = Currency.unwrap(key.currency0);
         address c1 = Currency.unwrap(key.currency1);
@@ -498,7 +502,6 @@ contract MRLVHook is BaseHook, IUnlockCallback {
             IERC20(c1).transfer(pos.owner, pos.amount1);
         }
 
-        emit LiquidityWithdrawnPending(posKey, pos.poolId, pos.owner, pos.amount0, pos.amount1);
         return true;
     }
 
@@ -526,4 +529,5 @@ contract MRLVHook is BaseHook, IUnlockCallback {
         owner = pos.owner;
     }
 }
+
 
