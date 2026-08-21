@@ -48,7 +48,7 @@ contract RewardVault is ReentrancyGuard {
     event Deposited(bytes32 indexed poolId, uint256 amount, uint256 blockNumber);
     event Distributed(bytes32 indexed poolId, uint256 amount);
     event Claimed(address indexed lp, uint256 amount);
-    event ExitPenaltyApplied(address indexed lp, uint256 penaltyAmount);
+    event ExitPenaltyApplied(address indexed lp, bytes32 indexed poolId, uint256 penaltyAmount);
 
     modifier onlyGovernance() {
         if (msg.sender != governance) revert NotGovernance();
@@ -190,7 +190,7 @@ contract RewardVault is ReentrancyGuard {
             penaltyReserves += penalty;
             poolDistributable[poolId] += penalty;
 
-            emit ExitPenaltyApplied(lp, penalty);
+            emit ExitPenaltyApplied(lp, poolId, penalty);
         }
     }
 }

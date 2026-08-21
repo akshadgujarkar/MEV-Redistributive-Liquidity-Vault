@@ -58,6 +58,18 @@ contract LoyaltyNFT is ERC721 {
         emit TierUpdated(tokenId, newTier);
     }
 
+    /// @notice Checks if a token exists.
+    function exists(uint256 tokenId) external view returns (bool) {
+        return _ownerOf(tokenId) != address(0);
+    }
+
+    /// @notice Burns a badge when LP completely exits. Only callable by the LoyaltyManager.
+    function burn(uint256 tokenId) external onlyLoyaltyManager {
+        if (_ownerOf(tokenId) == address(0)) revert TokenDoesNotExist();
+        _burn(tokenId);
+        delete tokenTier[tokenId];
+    }
+
     /// @notice Token metadata URI mapping to visual tiers on-chain/IPFS.
     function tokenURI(uint256 tokenId) public view override returns (string memory) {
         if (_ownerOf(tokenId) == address(0)) revert TokenDoesNotExist();
