@@ -4,7 +4,8 @@ pragma solidity ^0.8.26;
 interface ILoyaltyNFT {
     function mint(address to, uint256 tokenId, uint8 tier) external;
     function upgradeTier(uint256 tokenId, uint8 newTier) external;
-    function balanceOf(address owner) external view returns (uint256);
+    function burn(uint256 tokenId) external;
+    function exists(uint256 tokenId) external view returns (bool);
 }
 
 interface IRewardVault {
@@ -12,11 +13,12 @@ interface IRewardVault {
 }
 
 /// @title LoyaltyManager
-/// @notice Manages LP tenure, loyalty tiers, NFT badges, and LPScore calculations
+/// @notice Manages LP tenure, loyalty tiers, NFT badges, and LPScore calculations per pool
 contract LoyaltyManager {
     error NotGovernance();
     error NotHook();
     error InvalidThresholds();
+    error InsufficientLiquidity(address lp, bytes32 poolId, uint256 available, uint256 requested);
 
     address public governance;
     address public hook;
@@ -28,9 +30,9 @@ contract LoyaltyManager {
     uint256 public silverThresholdBlocks = 216000; // default 30 days
     uint256 public goldThresholdBlocks = 648000; // default 90 days
 
-    mapping(address => uint256) public firstDepositBlock;
-    mapping(address => uint256) public liquidityAmount;
-    mapping(address => uint8) public tier; // 0 = Bronze, 1 = Silver, 2 = Gold
+    mapping(address => mapping(bytes32 => uint256)) public firstDepositBlock;
+    mapping(address => mapping(bytes32 => uint256)) public liquidityAmount;
+    mapping(address => mapping(bytes32 => uint8)) public tier; // 0 = Bronze, 1 = Silver, 2 = Gold
     mapping(address => uint256) public consistencyIndex;
     mapping(address => bool) public flaggedMalicious;
     mapping(bytes32 => uint256) public poolLiquidity;
@@ -40,8 +42,8 @@ contract LoyaltyManager {
     event RewardVaultUpdated(address indexed newRewardVault);
     event LoyaltyNFTUpdated(address indexed newLoyaltyNFT);
     event OracleRelayerUpdated(address indexed newOracleRelayer);
-    event TierUpgraded(address indexed lp, uint8 newTier);
-    event ExitPenaltyApplied(address indexed lp, uint256 blockNumber);
+    event TierUpgraded(address indexed lp, bytes32 indexed poolId, uint8 newTier);
+    event ExitPenaltyApplied(address indexed lp, bytes32 indexed poolId, uint256 blockNumber);
     event ConsistencyIndexUpdated(address indexed lp, uint256 newIndex);
     event MaliciousStatusUpdated(address indexed lp, bool flagged);
 
@@ -112,40 +114,51 @@ contract LoyaltyManager {
 
     /// @notice Handler for adding liquidity
     function onAddLiquidity(address lp, uint128 liquidity, bytes32 poolId) external onlyHook {
-        if (firstDepositBlock[lp] == 0) {
-            firstDepositBlock[lp] = block.number;
+        if (firstDepositBlock[lp][poolId] == 0) {
+            firstDepositBlock[lp][poolId] = block.number;
+            _updateTierAndNFT(lp, poolId);
+        } else {
+            _updateTierAndNFT(lp, poolId);
+            firstDepositBlock[lp][poolId] = block.number;
         }
-        liquidityAmount[lp] += liquidity;
-        poolLiquidity[poolId] += liquidity;
 
-        _updateTierAndNFT(lp);
+        liquidityAmount[lp][poolId] += liquidity;
+        poolLiquidity[poolId] += liquidity;
     }
 
     /// @notice Handler for removing liquidity
     function onRemoveLiquidity(address lp, uint128 liquidity, bytes32 poolId) external onlyHook {
-        uint256 currentAmount = liquidityAmount[lp];
-        liquidityAmount[lp] = currentAmount >= liquidity ? currentAmount - liquidity : 0;
+        uint256 currentAmount = liquidityAmount[lp][poolId];
+        if (currentAmount < liquidity) {
+            revert InsufficientLiquidity(lp, poolId, currentAmount, liquidity);
+        }
+        liquidityAmount[lp][poolId] = currentAmount - liquidity;
         poolLiquidity[poolId] = poolLiquidity[poolId] >= liquidity ? poolLiquidity[poolId] - liquidity : 0;
 
-        uint256 startBlock = firstDepositBlock[lp];
+        uint256 startBlock = firstDepositBlock[lp][poolId];
         if (startBlock > 0 && block.number - startBlock < earlyWithdrawWindow) {
             if (rewardVault != address(0)) {
                 IRewardVault(rewardVault).applyExitPenalty(lp, poolId);
             }
-            emit ExitPenaltyApplied(lp, block.number);
+            emit ExitPenaltyApplied(lp, poolId, block.number);
         }
 
-        if (liquidityAmount[lp] == 0) {
-            firstDepositBlock[lp] = 0;
-            tier[lp] = 0;
-        } else {
-            _updateTierAndNFT(lp);
+        if (liquidityAmount[lp][poolId] == 0) {
+            firstDepositBlock[lp][poolId] = 0;
+            tier[lp][poolId] = 0;
+            if (loyaltyNFT != address(0)) {
+                uint256 tokenId = uint256(keccak256(abi.encodePacked(lp, poolId)));
+                if (ILoyaltyNFT(loyaltyNFT).exists(tokenId)) {
+                    ILoyaltyNFT(loyaltyNFT).burn(tokenId);
+                }
+            }
         }
+        // if the LP only partially withdraws, preserve the remaining pool position and its loyalty state
     }
 
     /// @notice Updates LP's tier and mints or upgrades their loyalty NFT.
-    function _updateTierAndNFT(address lp) internal {
-        uint256 startBlock = firstDepositBlock[lp];
+    function _updateTierAndNFT(address lp, bytes32 poolId) internal {
+        uint256 startBlock = firstDepositBlock[lp][poolId];
         if (startBlock == 0) return;
 
         uint256 duration = block.number - startBlock;
@@ -156,15 +169,15 @@ contract LoyaltyManager {
             newTier = 1;
         }
 
-        uint8 oldTier = tier[lp];
+        uint8 oldTier = tier[lp][poolId];
         if (newTier != oldTier) {
-            tier[lp] = newTier;
-            emit TierUpgraded(lp, newTier);
+            tier[lp][poolId] = newTier;
+            emit TierUpgraded(lp, poolId, newTier);
         }
 
         if (loyaltyNFT != address(0)) {
-            uint256 tokenId = uint256(uint160(lp));
-            if (ILoyaltyNFT(loyaltyNFT).balanceOf(lp) == 0) {
+            uint256 tokenId = uint256(keccak256(abi.encodePacked(lp, poolId)));
+            if (!ILoyaltyNFT(loyaltyNFT).exists(tokenId)) {
                 ILoyaltyNFT(loyaltyNFT).mint(lp, tokenId, newTier);
             } else {
                 ILoyaltyNFT(loyaltyNFT).upgradeTier(tokenId, newTier);
@@ -194,12 +207,12 @@ contract LoyaltyManager {
         // 1. Calculate raw values and find min/max
         for (uint256 i = 0; i < len; i++) {
             address lp = lps[i];
-            if (firstDepositBlock[lp] == 0 || flaggedMalicious[lp]) {
+            if (firstDepositBlock[lp][poolId] == 0 || flaggedMalicious[lp]) {
                 continue;
             }
 
-            uint256 amt = liquidityAmount[lp];
-            uint256 dur = block.number - firstDepositBlock[lp];
+            uint256 amt = liquidityAmount[lp][poolId];
+            uint256 dur = block.number - firstDepositBlock[lp][poolId];
             uint256 contr = totalPoolLiq == 0 ? 0 : (amt * 10000) / totalPoolLiq;
 
             amounts[i] = amt;
@@ -219,7 +232,7 @@ contract LoyaltyManager {
         // 2. Compute normalized scores using weights: w1=35, w2=30, w3=15, w4=20
         for (uint256 i = 0; i < len; i++) {
             address lp = lps[i];
-            if (firstDepositBlock[lp] == 0 || flaggedMalicious[lp]) {
+            if (firstDepositBlock[lp][poolId] == 0 || flaggedMalicious[lp]) {
                 scores[i] = 0;
                 continue;
             }
@@ -246,7 +259,7 @@ contract LoyaltyManager {
             uint256 baseScore = (35 * normAmt + 30 * normDur + 15 * consistencyTerm + 20 * normContr) / 100;
 
             // Apply loyalty tier multiplier: Bronze = 1x, Silver = 2x, Gold = 3x
-            uint8 lpTier = tier[lp];
+            uint8 lpTier = tier[lp][poolId];
             uint256 multiplier = lpTier == 2 ? 3 : (lpTier == 1 ? 2 : 1);
             scores[i] = baseScore * multiplier;
         }

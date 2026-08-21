@@ -40,32 +40,6 @@ contract MockPoolManager2 {
     function take(Currency, address, uint256) external {}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Helper: Attacker contract that tries to reenter claim()
-// ─────────────────────────────────────────────────────────────────────────────
-contract ReentrantClaimer {
-    RewardVault public vault;
-    bool public attacked;
-
-    constructor(RewardVault _vault) {
-        vault = _vault;
-    }
-
-    receive() external payable {
-        if (!attacked) {
-            attacked = true;
-            vault.claim(); // reentrancy attempt
-        }
-    }
-
-    function doClaim() external {
-        vault.claim();
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Main test suite
-// ─────────────────────────────────────────────────────────────────────────────
 contract MRLVRewardsTest is Test {
     using PoolIdLibrary for PoolKey;
 
@@ -74,8 +48,8 @@ contract MRLVRewardsTest is Test {
     MEVDetector public detector;
     DynamicFeeManager public feeManager;
     AnalyticsEmitter public analytics;
-    MRLVToken public mrlvToken; // concrete type for mint/lock/withdraw calls
-    IMRLVToken public iMrlvToken; // interface type passed to RewardVault
+    MRLVToken public mrlvToken;
+    IMRLVToken public iMrlvToken;
     LoyaltyNFT public loyaltyNFT;
     LoyaltyManager public loyaltyManager;
     RewardVault public rewardVault;
@@ -88,9 +62,12 @@ contract MRLVRewardsTest is Test {
     address public lp2 = address(0x1002);
     address public lp3 = address(0x1003);
 
-    // ── Pool key ─────────────────────────────────────────────────────────────
+    // ── Pool Keys & IDs ──────────────────────────────────────────────────────
     PoolKey public poolKey;
     bytes32 public poolId;
+
+    PoolKey public poolKeyB;
+    bytes32 public poolIdB;
 
     // ─── Setup ───────────────────────────────────────────────────────────────
     function setUp() public {
@@ -161,7 +138,7 @@ contract MRLVRewardsTest is Test {
         hook.setLoyaltyManager(loyaltyManager);
         vm.stopPrank();
 
-        // Simple pool key for tests
+        // Pool A key
         poolKey = PoolKey({
             currency0: Currency.wrap(address(0)),
             currency1: Currency.wrap(address(1)),
@@ -170,6 +147,16 @@ contract MRLVRewardsTest is Test {
             hooks: hook
         });
         poolId = PoolId.unwrap(poolKey.toId());
+
+        // Pool B key
+        poolKeyB = PoolKey({
+            currency0: Currency.wrap(address(0)),
+            currency1: Currency.wrap(address(2)),
+            fee: 0x800000,
+            tickSpacing: 60,
+            hooks: hook
+        });
+        poolIdB = PoolId.unwrap(poolKeyB.toId());
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -188,7 +175,6 @@ contract MRLVRewardsTest is Test {
     }
 
     function test_MRLVToken_lockAndVotingPower() public {
-        // Mint and lock
         vm.prank(address(rewardVault));
         mrlvToken.mint(lp1, 200 ether);
 
@@ -196,7 +182,7 @@ contract MRLVRewardsTest is Test {
         mrlvToken.lock(100 ether, 365 days);
         vm.stopPrank();
 
-        assertEq(mrlvToken.balanceOf(lp1), 100 ether); // remaining unlocked
+        assertEq(mrlvToken.balanceOf(lp1), 100 ether);
         assertGt(mrlvToken.votingPowerOf(lp1), 0);
     }
 
@@ -264,21 +250,21 @@ contract MRLVRewardsTest is Test {
         vm.prank(address(hook));
         loyaltyManager.onAddLiquidity(lp1, 1000, bytes32(poolId));
 
-        assertEq(loyaltyManager.firstDepositBlock(lp1), block.number);
-        assertEq(loyaltyManager.liquidityAmount(lp1), 1000);
+        assertEq(loyaltyManager.firstDepositBlock(lp1, bytes32(poolId)), block.number);
+        assertEq(loyaltyManager.liquidityAmount(lp1, bytes32(poolId)), 1000);
     }
 
-    function test_LoyaltyManager_onAddLiquidity_doesNotResetFirstBlock() public {
+    function test_LoyaltyManager_onAddLiquidity_resetsFirstBlock() public {
         vm.prank(address(hook));
         loyaltyManager.onAddLiquidity(lp1, 1000, bytes32(poolId));
-        uint256 firstBlock = loyaltyManager.firstDepositBlock(lp1);
 
         vm.roll(block.number + 10);
         vm.prank(address(hook));
         loyaltyManager.onAddLiquidity(lp1, 500, bytes32(poolId));
 
-        assertEq(loyaltyManager.firstDepositBlock(lp1), firstBlock);
-        assertEq(loyaltyManager.liquidityAmount(lp1), 1500);
+        // Starts/resets that pool's window, so firstDepositBlock updates to block.number
+        assertEq(loyaltyManager.firstDepositBlock(lp1, bytes32(poolId)), block.number);
+        assertEq(loyaltyManager.liquidityAmount(lp1, bytes32(poolId)), 1500);
     }
 
     function test_LoyaltyManager_tierProgressesToSilver() public {
@@ -288,9 +274,9 @@ contract MRLVRewardsTest is Test {
         // Fast-forward past silver threshold (216000 blocks)
         vm.roll(block.number + 216001);
         vm.prank(address(hook));
-        loyaltyManager.onAddLiquidity(lp1, 1, bytes32(poolId)); // trigger update
+        loyaltyManager.onAddLiquidity(lp1, 1, bytes32(poolId)); // trigger update (which updates using old timer, then resets)
 
-        assertEq(loyaltyManager.tier(lp1), 1); // Silver
+        assertEq(loyaltyManager.tier(lp1, bytes32(poolId)), 1); // Silver
     }
 
     function test_LoyaltyManager_tierProgressesToGold() public {
@@ -302,7 +288,7 @@ contract MRLVRewardsTest is Test {
         vm.prank(address(hook));
         loyaltyManager.onAddLiquidity(lp1, 1, bytes32(poolId));
 
-        assertEq(loyaltyManager.tier(lp1), 2); // Gold
+        assertEq(loyaltyManager.tier(lp1, bytes32(poolId)), 2); // Gold
     }
 
     function test_LoyaltyManager_onRemoveLiquidity_reducesAmount() public {
@@ -315,7 +301,7 @@ contract MRLVRewardsTest is Test {
         vm.prank(address(hook));
         loyaltyManager.onRemoveLiquidity(lp1, 400, bytes32(poolId));
 
-        assertEq(loyaltyManager.liquidityAmount(lp1), 600);
+        assertEq(loyaltyManager.liquidityAmount(lp1, bytes32(poolId)), 600);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -323,11 +309,9 @@ contract MRLVRewardsTest is Test {
     // ═══════════════════════════════════════════════════════════════════════════
 
     function test_ExitPenalty_forfeitHalfAccruedRewards() public {
-        // Seed claimable rewards manually via deposit + distribute
         vm.prank(address(hook));
         rewardVault.deposit(bytes32(poolId), 1000 ether);
 
-        // Seed loyalty for lp1
         vm.prank(address(hook));
         loyaltyManager.onAddLiquidity(lp1, 1000, bytes32(poolId));
 
@@ -338,12 +322,11 @@ contract MRLVRewardsTest is Test {
         uint256 claimableBefore = rewardVault.claimable(lp1);
         assertGt(claimableBefore, 0);
 
-        // Remove liquidity early (before earlyWithdrawWindow)
+        // Remove liquidity early
         vm.prank(address(hook));
         loyaltyManager.onRemoveLiquidity(lp1, 1000, bytes32(poolId));
 
         uint256 claimableAfter = rewardVault.claimable(lp1);
-        // 50% penalty applied
         assertApproxEqAbs(claimableAfter, claimableBefore / 2, 1);
     }
 
@@ -359,14 +342,11 @@ contract MRLVRewardsTest is Test {
         vm.prank(address(hook));
         rewardVault.deposit(bytes32(poolId), 1000 ether);
 
-        // 5% of 1000 ether = 50 ether to insurancePool
         assertEq(mrlvToken.balanceOf(insurancePool), 50 ether);
-        // 950 ether distributable
         assertEq(rewardVault.poolDistributable(bytes32(poolId)), 950 ether);
     }
 
     function test_RewardVault_distribute_proRataByScore() public {
-        // lp1 has 2x the liquidity of lp2 -> should receive proportionally more
         vm.startPrank(address(hook));
         loyaltyManager.onAddLiquidity(lp1, 2000, bytes32(poolId));
         loyaltyManager.onAddLiquidity(lp2, 1000, bytes32(poolId));
@@ -382,7 +362,6 @@ contract MRLVRewardsTest is Test {
         uint256 claimable2 = rewardVault.claimable(lp2);
         assertGt(claimable1, 0);
         assertGt(claimable2, 0);
-        // lp1 should get more than lp2
         assertGt(claimable1, claimable2);
     }
 
@@ -422,13 +401,10 @@ contract MRLVRewardsTest is Test {
     // ═══════════════════════════════════════════════════════════════════════════
 
     function test_RewardVault_claim_reentrancyGuard() public {
-        // Give the reentrant claimer some claimable balance
         vm.startPrank(address(hook));
         rewardVault.deposit(bytes32(poolId), 100 ether);
         vm.stopPrank();
 
-        // We can't easily simulate a real reentrancy with ERC-20 (no ETH callback),
-        // but we verify the guard exists by ensuring double-claim is blocked
         vm.prank(address(hook));
         loyaltyManager.onAddLiquidity(lp1, 1000, bytes32(poolId));
 
@@ -436,11 +412,9 @@ contract MRLVRewardsTest is Test {
         lps[0] = lp1;
         rewardVault.distribute(bytes32(poolId), lps);
 
-        // First claim succeeds
         vm.prank(lp1);
         rewardVault.claim();
 
-        // Second claim (simulating reentrancy path) reverts with ZeroClaim
         vm.prank(lp1);
         vm.expectRevert(RewardVault.ZeroClaim.selector);
         rewardVault.claim();
@@ -451,16 +425,9 @@ contract MRLVRewardsTest is Test {
     // ═══════════════════════════════════════════════════════════════════════════
 
     function test_Sybil_perWalletRewardLessThanWhale() public {
-        // Verify sybil-resistance: each individual sybil wallet earns fewer
-        // rewards per unit of liquidity than the concentrated whale.
-        // The whale (3000) should individually earn more than any single sybil
-        // wallet (1000) because the score formula rewards concentration (normAmt).
-
-        // Single whale with 3000 liquidity
         vm.prank(address(hook));
         loyaltyManager.onAddLiquidity(lp1, 3000, bytes32(poolId));
 
-        // Three small wallets with 1000 each (same total liquidity)
         vm.startPrank(address(hook));
         loyaltyManager.onAddLiquidity(lp2, 1000, bytes32(poolId));
         loyaltyManager.onAddLiquidity(lp3, 1000, bytes32(poolId));
@@ -481,12 +448,10 @@ contract MRLVRewardsTest is Test {
         uint256 sybil2Claim  = rewardVault.claimable(lp3);
         uint256 sybil3Claim  = rewardVault.claimable(lp4);
 
-        // Core sybil-resistance invariant: whale earns more than any single sybil
         assertGt(whaleClaim, sybil1Claim, "whale should beat sybil1");
         assertGt(whaleClaim, sybil2Claim, "whale should beat sybil2");
         assertGt(whaleClaim, sybil3Claim, "whale should beat sybil3");
 
-        // All sybils get equal shares (same liquidity, same tenure, same tier)
         assertEq(sybil1Claim, sybil2Claim, "sybil shares should be equal");
         assertEq(sybil2Claim, sybil3Claim, "sybil shares should be equal");
     }
@@ -510,16 +475,14 @@ contract MRLVRewardsTest is Test {
         rewardVault.distribute(bytes32(poolId), lps);
         uint256 claimable1AfterEpoch1 = rewardVault.claimable(lp1);
 
-        // Epoch 2 — another deposit + distribute (before claim)
+        // Epoch 2
         vm.prank(address(hook));
         rewardVault.deposit(bytes32(poolId), 200 ether);
         rewardVault.distribute(bytes32(poolId), lps);
         uint256 claimable1AfterEpoch2 = rewardVault.claimable(lp1);
 
-        // Claimable should have grown across epochs
         assertGt(claimable1AfterEpoch2, claimable1AfterEpoch1);
 
-        // Claim should clear it
         vm.prank(lp1);
         rewardVault.claim();
         assertEq(rewardVault.claimable(lp1), 0);
@@ -539,5 +502,200 @@ contract MRLVRewardsTest is Test {
         vm.prank(lp1);
         vm.expectRevert(LoyaltyManager.NotHook.selector);
         loyaltyManager.onRemoveLiquidity(lp1, 1000, bytes32(poolId));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  Section 10: Pool-specific loyalty tracking and validation tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Verify separate Pool A / Pool B positions
+    function test_PoolIndependence_PoolAPoolB() public {
+        vm.startPrank(address(hook));
+        loyaltyManager.onAddLiquidity(lp1, 1000, bytes32(poolId));
+        loyaltyManager.onAddLiquidity(lp1, 2500, bytes32(poolIdB));
+        vm.stopPrank();
+
+        assertEq(loyaltyManager.liquidityAmount(lp1, bytes32(poolId)), 1000);
+        assertEq(loyaltyManager.liquidityAmount(lp1, bytes32(poolIdB)), 2500);
+        assertEq(loyaltyManager.firstDepositBlock(lp1, bytes32(poolId)), block.number);
+        assertEq(loyaltyManager.firstDepositBlock(lp1, bytes32(poolIdB)), block.number);
+    }
+
+    /// @notice Verify timer reset on every deposit
+    function test_TimerResetOnEveryDeposit() public {
+        vm.roll(10);
+        vm.prank(address(hook));
+        loyaltyManager.onAddLiquidity(lp1, 1000, bytes32(poolId));
+        assertEq(loyaltyManager.firstDepositBlock(lp1, bytes32(poolId)), 10);
+
+        vm.roll(25);
+        vm.prank(address(hook));
+        loyaltyManager.onAddLiquidity(lp1, 500, bytes32(poolId));
+        assertEq(loyaltyManager.firstDepositBlock(lp1, bytes32(poolId)), 25);
+    }
+
+    /// @notice Verify early and non-early withdrawals
+    function test_EarlyAndNonEarlyWithdrawals() public {
+        vm.prank(address(hook));
+        loyaltyManager.onAddLiquidity(lp1, 1000, bytes32(poolId));
+
+        // Seed some claimable rewards for penalty application
+        vm.prank(address(hook));
+        rewardVault.deposit(bytes32(poolId), 100 ether);
+        address[] memory lps = new address[](1);
+        lps[0] = lp1;
+        rewardVault.distribute(bytes32(poolId), lps);
+
+        uint256 startClaimable = rewardVault.claimable(lp1);
+        assertGt(startClaimable, 0);
+
+        // Early withdrawal (before earlyWithdrawWindow of 50400)
+        vm.roll(block.number + 100);
+        vm.prank(address(hook));
+        loyaltyManager.onRemoveLiquidity(lp1, 100, bytes32(poolId));
+        // Penalty of 50% should be applied
+        assertApproxEqAbs(rewardVault.claimable(lp1), startClaimable / 2, 1);
+
+        // Non-early withdrawal (after window)
+        // Reset/re-deposit to get window starting at block.number (which is block 101 now)
+        vm.prank(address(hook));
+        loyaltyManager.onAddLiquidity(lp1, 100, bytes32(poolId)); // resets window start to 101
+        
+        vm.roll(block.number + 50405); // Roll past window
+        uint256 claimableBeforeNoPenalty = rewardVault.claimable(lp1);
+
+        vm.prank(address(hook));
+        loyaltyManager.onRemoveLiquidity(lp1, 100, bytes32(poolId));
+        // No penalty should be applied
+        assertEq(rewardVault.claimable(lp1), claimableBeforeNoPenalty);
+    }
+
+    /// @notice Verify partial withdrawals preserve remaining loyalty state
+    function test_PartialWithdrawalPreservesState() public {
+        vm.prank(address(hook));
+        loyaltyManager.onAddLiquidity(lp1, 1000, bytes32(poolId));
+
+        // Progress to Silver
+        vm.roll(block.number + 216005);
+        vm.prank(address(hook));
+        loyaltyManager.onAddLiquidity(lp1, 10, bytes32(poolId)); // upgrades to Silver, resets window start
+        assertEq(loyaltyManager.tier(lp1, bytes32(poolId)), 1); // Silver
+
+        uint256 tokenAId = uint256(keccak256(abi.encodePacked(lp1, poolId)));
+        assertTrue(loyaltyNFT.exists(tokenAId));
+        assertEq(loyaltyNFT.tokenTier(tokenAId), 1);
+
+        // Partial withdrawal
+        vm.prank(address(hook));
+        loyaltyManager.onRemoveLiquidity(lp1, 500, bytes32(poolId));
+
+        // Remaining position preserved
+        assertEq(loyaltyManager.liquidityAmount(lp1, bytes32(poolId)), 510);
+        // Loyalty tier preserved (Silver)
+        assertEq(loyaltyManager.tier(lp1, bytes32(poolId)), 1);
+        assertTrue(loyaltyNFT.exists(tokenAId));
+        assertEq(loyaltyNFT.tokenTier(tokenAId), 1);
+    }
+
+    /// @notice Verify complete exit with NFT burn
+    function test_CompleteExitNFTBurn() public {
+        vm.prank(address(hook));
+        loyaltyManager.onAddLiquidity(lp1, 1000, bytes32(poolId));
+
+        uint256 tokenId = uint256(keccak256(abi.encodePacked(lp1, poolId)));
+        assertTrue(loyaltyNFT.exists(tokenId));
+
+        // Complete exit
+        vm.roll(block.number + 60000); // Past early withdraw window so we don't trigger penalty (optional)
+        vm.prank(address(hook));
+        loyaltyManager.onRemoveLiquidity(lp1, 1000, bytes32(poolId));
+
+        // State reset
+        assertEq(loyaltyManager.liquidityAmount(lp1, bytes32(poolId)), 0);
+        assertEq(loyaltyManager.firstDepositBlock(lp1, bytes32(poolId)), 0);
+        assertEq(loyaltyManager.tier(lp1, bytes32(poolId)), 0);
+        // NFT burned
+        assertFalse(loyaltyNFT.exists(tokenId));
+    }
+
+    /// @notice Verify invalid over-withdrawal reverts
+    function test_InvalidOverWithdrawal() public {
+        vm.prank(address(hook));
+        loyaltyManager.onAddLiquidity(lp1, 1000, bytes32(poolId));
+
+        vm.prank(address(hook));
+        vm.expectRevert(abi.encodeWithSelector(
+            LoyaltyManager.InsufficientLiquidity.selector,
+            lp1,
+            bytes32(poolId),
+            1000,
+            1001
+        ));
+        loyaltyManager.onRemoveLiquidity(lp1, 1001, bytes32(poolId));
+    }
+
+    /// @notice Verify independent tiers/NFTs per pool
+    function test_IndependentTiersAndNFTs() public {
+        // Alice deposits in Pool A and Pool B
+        vm.startPrank(address(hook));
+        loyaltyManager.onAddLiquidity(lp1, 1000, bytes32(poolId));
+        loyaltyManager.onAddLiquidity(lp1, 2000, bytes32(poolIdB));
+        vm.stopPrank();
+
+        uint256 tokenAId = uint256(keccak256(abi.encodePacked(lp1, poolId)));
+        uint256 tokenBId = uint256(keccak256(abi.encodePacked(lp1, poolIdB)));
+
+        assertNotEq(tokenAId, tokenBId); // Ensure no collision
+
+        // Alice waits past silver threshold for Pool A, but then deposits again in Pool A to upgrade it
+        vm.roll(block.number + 216005);
+        vm.prank(address(hook));
+        loyaltyManager.onAddLiquidity(lp1, 10, bytes32(poolId)); // Upgrade A to Silver
+
+        // Pool A is Silver (1), Pool B remains Bronze (0)
+        assertEq(loyaltyManager.tier(lp1, bytes32(poolId)), 1);
+        assertEq(loyaltyManager.tier(lp1, bytes32(poolIdB)), 0);
+
+        assertEq(loyaltyNFT.tokenTier(tokenAId), 1);
+        assertEq(loyaltyNFT.tokenTier(tokenBId), 0);
+
+        // Complete exit from Pool A
+        vm.prank(address(hook));
+        loyaltyManager.onRemoveLiquidity(lp1, 1010, bytes32(poolId));
+
+        // Pool A reset, Pool B untouched
+        assertEq(loyaltyManager.liquidityAmount(lp1, bytes32(poolId)), 0);
+        assertEq(loyaltyManager.tier(lp1, bytes32(poolId)), 0);
+        assertFalse(loyaltyNFT.exists(tokenAId));
+
+        assertEq(loyaltyManager.liquidityAmount(lp1, bytes32(poolIdB)), 2000);
+        assertEq(loyaltyManager.tier(lp1, bytes32(poolIdB)), 0);
+        assertTrue(loyaltyNFT.exists(tokenBId));
+    }
+
+    /// @notice Verify pool-specific LP score calculation
+    function test_PoolSpecificLPScoreCalculation() public {
+        // Pool A: lp1 has 1000, lp2 has 2000
+        // Pool B: lp1 has 3000, lp2 has 1000
+        vm.startPrank(address(hook));
+        loyaltyManager.onAddLiquidity(lp1, 1000, bytes32(poolId));
+        loyaltyManager.onAddLiquidity(lp2, 2000, bytes32(poolId));
+
+        loyaltyManager.onAddLiquidity(lp1, 3000, bytes32(poolIdB));
+        loyaltyManager.onAddLiquidity(lp2, 1000, bytes32(poolIdB));
+        vm.stopPrank();
+
+        address[] memory lps = new address[](2);
+        lps[0] = lp1;
+        lps[1] = lp2;
+
+        uint256[] memory scoresA = loyaltyManager.computeLPScores(lps, bytes32(poolId));
+        uint256[] memory scoresB = loyaltyManager.computeLPScores(lps, bytes32(poolIdB));
+
+        // In Pool A, lp2 has more liquidity than lp1, so score should be higher
+        assertGt(scoresA[1], scoresA[0], "lp2 should have higher score in Pool A");
+
+        // In Pool B, lp1 has more liquidity than lp2, so score should be higher
+        assertGt(scoresB[0], scoresB[1], "lp1 should have higher score in Pool B");
     }
 }
