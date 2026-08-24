@@ -31,9 +31,16 @@ contract LoyaltyManager {
     uint256 public silverThresholdBlocks = 216000; // default 30 days
     uint256 public goldThresholdBlocks = 648000; // default 90 days
 
-    mapping(address => mapping(bytes32 => uint256)) public firstDepositBlock;
-    mapping(address => mapping(bytes32 => uint256)) public liquidityAmount;
-    mapping(address => mapping(bytes32 => uint8)) public tier; // 0 = Bronze, 1 = Silver, 2 = Gold
+    struct Position {
+        uint256 id;
+        uint256 amount;
+        uint256 startBlock;
+        uint8 tier; // 0 = Bronze, 1 = Silver, 2 = Gold
+    }
+
+    uint256 public nextPositionId = 1;
+    mapping(address => mapping(bytes32 => Position[])) public userPositions;
+
     mapping(address => uint256) public consistencyIndex;
     mapping(address => bool) public flaggedMalicious;
     mapping(bytes32 => uint256) public poolLiquidity;
@@ -112,76 +119,100 @@ contract LoyaltyManager {
         flaggedMalicious[lp] = flagged;
         emit MaliciousStatusUpdated(lp, flagged);
     }
- // 100 + 50
+
     /// @notice Handler for adding liquidity
     function onAddLiquidity(address lp, uint128 liquidity, bytes32 poolId) external onlyHook {
-        if (firstDepositBlock[lp][poolId] == 0) {
-            firstDepositBlock[lp][poolId] = block.number;
-            _updateTierAndNFT(lp, poolId);
-        } else {
-            _updateTierAndNFT(lp, poolId); // silver 
-            firstDepositBlock[lp][poolId] = block.number; // bronze 
+        uint256 posId = nextPositionId++;
+        userPositions[lp][poolId].push(Position({
+            id: posId,
+            amount: liquidity,
+            startBlock: block.number,
+            tier: 0
+        }));
+
+        if (loyaltyNFT != address(0)) {
+            ILoyaltyNFT(loyaltyNFT).mint(lp, posId, 0); // Mint position-specific Bronze NFT
         }
-        // 100 + 50 = 150 
-        liquidityAmount[lp][poolId] += liquidity;
+
         poolLiquidity[poolId] += liquidity;
     }
 
     /// @notice Handler for removing liquidity
     function onRemoveLiquidity(address lp, uint128 liquidity, bytes32 poolId) external onlyHook {
-        uint256 currentAmount = liquidityAmount[lp][poolId];
-        if (currentAmount < liquidity) {
-            revert InsufficientLiquidity(lp, poolId, currentAmount, liquidity);
+        Position[] storage positions = userPositions[lp][poolId];
+        
+        uint256 totalAmount = 0;
+        for (uint256 i = 0; i < positions.length; i++) {
+            totalAmount += positions[i].amount;
         }
-        liquidityAmount[lp][poolId] = currentAmount - liquidity;
-        poolLiquidity[poolId] = poolLiquidity[poolId] >= liquidity ? poolLiquidity[poolId] - liquidity : 0;
-
-        uint256 startBlock = firstDepositBlock[lp][poolId];
-        if (startBlock > 0 && block.number - startBlock < earlyWithdrawWindow) {
-            if (rewardVault != address(0)) {
-                IRewardVault(rewardVault).applyExitPenalty(lp, poolId);
-            }
-            emit ExitPenaltyApplied(lp, poolId, block.number);
+        if (totalAmount < liquidity) {
+            revert InsufficientLiquidity(lp, poolId, totalAmount, liquidity);
         }
 
-        if (liquidityAmount[lp][poolId] == 0) {
-            firstDepositBlock[lp][poolId] = 0;
-            tier[lp][poolId] = 0;
-            if (loyaltyNFT != address(0)) {
-                uint256 tokenId = uint256(keccak256(abi.encodePacked(lp, poolId)));
-                if (ILoyaltyNFT(loyaltyNFT).exists(tokenId)) {
-                    ILoyaltyNFT(loyaltyNFT).burn(tokenId);
+        uint256 remainingToRemove = liquidity;
+        bool appliedPenalty = false;
+
+        // LIFO: start from the newest position (end of the array)
+        for (uint256 i = positions.length; i > 0; i--) {
+            if (remainingToRemove == 0) break;
+            uint256 idx = i - 1;
+            Position storage pos = positions[idx];
+
+            if (!appliedPenalty && (block.number - pos.startBlock < earlyWithdrawWindow)) {
+                if (rewardVault != address(0)) {
+                    IRewardVault(rewardVault).applyExitPenalty(lp, poolId);
                 }
+                emit ExitPenaltyApplied(lp, poolId, block.number);
+                appliedPenalty = true; // Only apply penalty once per tx
+            }
+
+            if (pos.amount <= remainingToRemove) {
+                remainingToRemove -= pos.amount;
+                
+                // Burn specific NFT
+                if (loyaltyNFT != address(0)) {
+                    if (ILoyaltyNFT(loyaltyNFT).exists(pos.id)) {
+                        ILoyaltyNFT(loyaltyNFT).burn(pos.id);
+                    }
+                }
+
+                // Remove from array 
+                positions.pop();
+            } else {
+                pos.amount -= remainingToRemove;
+                remainingToRemove = 0;
             }
         }
-        // if the LP only partially withdraws, preserve the remaining pool position and its loyalty state
+
+        poolLiquidity[poolId] = poolLiquidity[poolId] >= liquidity ? poolLiquidity[poolId] - liquidity : 0;
     }
 
-    /// @notice Updates LP's tier and mints or upgrades their loyalty NFT.
-    function _updateTierAndNFT(address lp, bytes32 poolId) internal {
-        uint256 startBlock = firstDepositBlock[lp][poolId]; // 100  - 35 days 
-        if (startBlock == 0) return;
+    /// @notice Upgrades LP's tiers and their loyalty NFTs for all their positions in a pool.
+    function refreshTiers(address lp, bytes32 poolId) public {
+        Position[] storage positions = userPositions[lp][poolId];
+        for (uint256 i = 0; i < positions.length; i++) {
+            uint256 startBlock = positions[i].startBlock;
+            if (startBlock == 0) continue;
 
-        uint256 duration = block.number - startBlock;  // 35 days 
-        uint8 newTier = 0;
-        if (duration >= goldThresholdBlocks) {
-            newTier = 2;
-        } else if (duration >= silverThresholdBlocks) {
-            newTier = 1; // silver 
-        }
+            uint256 duration = block.number - startBlock;
+            uint8 newTier = 0;
+            if (duration >= goldThresholdBlocks) {
+                newTier = 2;
+            } else if (duration >= silverThresholdBlocks) {
+                newTier = 1;
+            }
 
-        uint8 oldTier = tier[lp][poolId]; // bronze 
-        if (newTier != oldTier) {
-            tier[lp][poolId] = newTier; // bronze to silver 
-            emit TierUpgraded(lp, poolId, newTier);
-        }
+            uint8 oldTier = positions[i].tier;
+            if (newTier != oldTier) {
+                positions[i].tier = newTier;
+                emit TierUpgraded(lp, poolId, newTier);
 
-        if (loyaltyNFT != address(0)) {
-            uint256 tokenId = uint256(keccak256(abi.encodePacked(lp, poolId)));
-            if (!ILoyaltyNFT(loyaltyNFT).exists(tokenId)) {
-                ILoyaltyNFT(loyaltyNFT).mint(lp, tokenId, newTier);
-            } else {
-                ILoyaltyNFT(loyaltyNFT).upgradeTier(tokenId, newTier);
+                if (loyaltyNFT != address(0)) {
+                    uint256 tokenId = positions[i].id;
+                    if (ILoyaltyNFT(loyaltyNFT).exists(tokenId)) {
+                        ILoyaltyNFT(loyaltyNFT).upgradeTier(tokenId, newTier);
+                    }
+                }
             }
         }
     }
@@ -192,10 +223,6 @@ contract LoyaltyManager {
         scores = new uint256[](len);
         if (len == 0) return scores;
 
-        uint256[] memory amounts = new uint256[](len);
-        uint256[] memory durations = new uint256[](len);
-        uint256[] memory contributions = new uint256[](len);
-
         uint256 minAmt = type(uint256).max;
         uint256 maxAmt = 0;
         uint256 minDur = type(uint256).max;
@@ -205,64 +232,102 @@ contract LoyaltyManager {
 
         uint256 totalPoolLiq = poolLiquidity[poolId];
 
-        // 1. Calculate raw values and find min/max
+        // 1. Calculate raw values and find min/max across all positions
         for (uint256 i = 0; i < len; i++) {
             address lp = lps[i];
-            if (firstDepositBlock[lp][poolId] == 0 || flaggedMalicious[lp]) {
-                continue;
+            if (flaggedMalicious[lp]) continue;
+
+            Position[] storage positions = userPositions[lp][poolId];
+            for (uint256 j = 0; j < positions.length; j++) {
+                uint256 amt = positions[j].amount;
+                uint256 dur = block.number - positions[j].startBlock;
+                uint256 contr = totalPoolLiq == 0 ? 0 : (amt * 10000) / totalPoolLiq;
+
+                if (amt < minAmt) minAmt = amt;
+                if (amt > maxAmt) maxAmt = amt;
+                if (dur < minDur) minDur = dur;
+                if (dur > maxDur) maxDur = dur;
+                if (contr < minContr) minContr = contr;
+                if (contr > maxContr) maxContr = contr;
             }
-
-            uint256 amt = liquidityAmount[lp][poolId];
-            uint256 dur = block.number - firstDepositBlock[lp][poolId];
-            uint256 contr = totalPoolLiq == 0 ? 0 : (amt * 10000) / totalPoolLiq;
-
-            amounts[i] = amt;
-            durations[i] = dur;
-            contributions[i] = contr;
-
-            if (amt < minAmt) minAmt = amt;
-            if (amt > maxAmt) maxAmt = amt;
-
-            if (dur < minDur) minDur = dur;
-            if (dur > maxDur) maxDur = dur;
-
-            if (contr < minContr) minContr = contr;
-            if (contr > maxContr) maxContr = contr;
         }
 
-        // 2. Compute normalized scores using weights: w1=35, w2=30, w3=15, w4=20
+        // 2. Compute normalized scores per position and sum them up
         for (uint256 i = 0; i < len; i++) {
             address lp = lps[i];
-            if (firstDepositBlock[lp][poolId] == 0 || flaggedMalicious[lp]) {
+            if (flaggedMalicious[lp]) {
                 scores[i] = 0;
                 continue;
-            }
-
-            uint256 normAmt = 1e18;
-            if (maxAmt > minAmt) {
-                normAmt = ((amounts[i] - minAmt) * 1e18) / (maxAmt - minAmt);
-            }
-
-            uint256 normDur = 1e18;
-            if (maxDur > minDur) {
-                normDur = ((durations[i] - minDur) * 1e18) / (maxDur - minDur);
-            }
-
-            uint256 normContr = 1e18;
-            if (maxContr > minContr) {
-                normContr = ((contributions[i] - minContr) * 1e18) / (maxContr - minContr);
             }
 
             uint256 consistency = consistencyIndex[lp];
             uint256 consistencyTerm = (1e18 * 1e18) / (1e18 + consistency);
 
-            // Calculate base weighted score (scaled by 1e18)
-            uint256 baseScore = (35 * normAmt + 30 * normDur + 15 * consistencyTerm + 20 * normContr) / 100;
+            uint256 totalLPScore = 0;
+            Position[] storage positions = userPositions[lp][poolId];
+            
+            for (uint256 j = 0; j < positions.length; j++) {
+                uint256 amt = positions[j].amount;
+                uint256 dur = block.number - positions[j].startBlock;
+                uint256 contr = totalPoolLiq == 0 ? 0 : (amt * 10000) / totalPoolLiq;
 
-            // Apply loyalty tier multiplier: Bronze = 1x, Silver = 2x, Gold = 3x
-            uint8 lpTier = tier[lp][poolId];
-            uint256 multiplier = lpTier == 2 ? 3 : (lpTier == 1 ? 2 : 1);
-            scores[i] = baseScore * multiplier;
+                uint256 normAmt = 1e18;
+                if (maxAmt > minAmt) {
+                    normAmt = ((amt - minAmt) * 1e18) / (maxAmt - minAmt);
+                }
+
+                uint256 normDur = 1e18;
+                if (maxDur > minDur) {
+                    normDur = ((dur - minDur) * 1e18) / (maxDur - minDur);
+                }
+
+                uint256 normContr = 1e18;
+                if (maxContr > minContr) {
+                    normContr = ((contr - minContr) * 1e18) / (maxContr - minContr);
+                }
+
+                // Calculate base weighted score for this position (scaled by 1e18)
+                uint256 posBaseScore = (35 * normAmt + 30 * normDur + 15 * consistencyTerm + 20 * normContr) / 100;
+
+                uint8 posTier = 0;
+                if (dur >= goldThresholdBlocks) {
+                    posTier = 2;
+                } else if (dur >= silverThresholdBlocks) {
+                    posTier = 1;
+                }
+                uint256 multiplier = posTier == 2 ? 3 : (posTier == 1 ? 2 : 1);
+                
+                totalLPScore += posBaseScore * multiplier;
+            }
+            
+            scores[i] = totalLPScore;
         }
     }
+
+    function getUserPositionsLength(address lp, bytes32 poolId) external view returns (uint256) {
+        return userPositions[lp][poolId].length;
+    }
+
+    function getUserTotalLiquidity(address lp, bytes32 poolId) external view returns (uint256 total) {
+        Position[] storage positions = userPositions[lp][poolId];
+        for (uint256 i = 0; i < positions.length; i++) {
+            total += positions[i].amount;
+        }
+    }
+    
+    function getUserFirstDepositBlock(address lp, bytes32 poolId) external view returns (uint256) {
+        Position[] storage positions = userPositions[lp][poolId];
+        if (positions.length == 0) return 0;
+        return positions[0].startBlock;
+    }
+
+    function getUserMaxTier(address lp, bytes32 poolId) external view returns (uint8 maxTier) {
+        Position[] storage positions = userPositions[lp][poolId];
+        for (uint256 i = 0; i < positions.length; i++) {
+            if (positions[i].tier > maxTier) {
+                maxTier = positions[i].tier;
+            }
+        }
+    }
+
 }
