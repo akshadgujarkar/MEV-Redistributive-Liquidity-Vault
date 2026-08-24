@@ -560,7 +560,7 @@ contract MRLVHook is BaseHook, IUnlockCallback, ReentrancyGuard {
                 }
             }
         }
-
+        // we have to call _updateTierAndNFT at every swap. 
         if (address(loyaltyManager) != address(0)) {
             loyaltyManager.onAddLiquidity(pos.owner, pos.liquidity, pos.poolId);
         }

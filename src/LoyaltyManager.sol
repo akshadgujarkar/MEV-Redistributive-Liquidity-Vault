@@ -26,6 +26,7 @@ contract LoyaltyManager {
     address public loyaltyNFT;
     address public oracleRelayer;
 
+   //  
     uint256 public earlyWithdrawWindow = 50400; // default 7 days in blocks (assuming 12s blocks)
     uint256 public silverThresholdBlocks = 216000; // default 30 days
     uint256 public goldThresholdBlocks = 648000; // default 90 days
@@ -111,17 +112,17 @@ contract LoyaltyManager {
         flaggedMalicious[lp] = flagged;
         emit MaliciousStatusUpdated(lp, flagged);
     }
-
+ // 100 + 50
     /// @notice Handler for adding liquidity
     function onAddLiquidity(address lp, uint128 liquidity, bytes32 poolId) external onlyHook {
         if (firstDepositBlock[lp][poolId] == 0) {
             firstDepositBlock[lp][poolId] = block.number;
             _updateTierAndNFT(lp, poolId);
         } else {
-            _updateTierAndNFT(lp, poolId);
-            firstDepositBlock[lp][poolId] = block.number;
+            _updateTierAndNFT(lp, poolId); // silver 
+            firstDepositBlock[lp][poolId] = block.number; // bronze 
         }
-
+        // 100 + 50 = 150 
         liquidityAmount[lp][poolId] += liquidity;
         poolLiquidity[poolId] += liquidity;
     }
@@ -158,20 +159,20 @@ contract LoyaltyManager {
 
     /// @notice Updates LP's tier and mints or upgrades their loyalty NFT.
     function _updateTierAndNFT(address lp, bytes32 poolId) internal {
-        uint256 startBlock = firstDepositBlock[lp][poolId];
+        uint256 startBlock = firstDepositBlock[lp][poolId]; // 100  - 35 days 
         if (startBlock == 0) return;
 
-        uint256 duration = block.number - startBlock;
+        uint256 duration = block.number - startBlock;  // 35 days 
         uint8 newTier = 0;
         if (duration >= goldThresholdBlocks) {
             newTier = 2;
         } else if (duration >= silverThresholdBlocks) {
-            newTier = 1;
+            newTier = 1; // silver 
         }
 
-        uint8 oldTier = tier[lp][poolId];
+        uint8 oldTier = tier[lp][poolId]; // bronze 
         if (newTier != oldTier) {
-            tier[lp][poolId] = newTier;
+            tier[lp][poolId] = newTier; // bronze to silver 
             emit TierUpgraded(lp, poolId, newTier);
         }
 

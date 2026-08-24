@@ -54,7 +54,7 @@ contract LoyaltyNFT is ERC721 {
     /// @notice Upgrades the tier of a badge. Only callable by the LoyaltyManager.
     function upgradeTier(uint256 tokenId, uint8 newTier) external onlyLoyaltyManager {
         if (_ownerOf(tokenId) == address(0)) revert TokenDoesNotExist();
-        tokenTier[tokenId] = newTier;
+        tokenTier[tokenId] = newTier;  // bronze to silver 
         emit TierUpdated(tokenId, newTier);
     }
 
