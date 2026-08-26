@@ -41,18 +41,21 @@ contract FantasyLeagueTest is Test {
         mockVault = new MockRewardVault(mrlv);
         mrlv.setRewardVault(address(mockVault));
 
-        league = new MEVScoutLeague(mrlv, ScoutRoster(address(0))); // Temporary
-        roster = new ScoutRoster(address(league));
-        
-        // Re-deploy league with actual roster
+        uint256 nonce = vm.getNonce(address(this));
+        address predictedLeague = vm.computeCreateAddress(address(this), nonce + 1);
+
+        roster = new ScoutRoster(predictedLeague);
         league = new MEVScoutLeague(mrlv, roster);
+        require(address(league) == predictedLeague, "Address prediction failed");
         
         oracle = new ScoutPointsOracle(relayer, roster);
         
-        // Wire them up
-        roster = new ScoutRoster(address(league));
-        league = new MEVScoutLeague(mrlv, roster);
-        oracle = new ScoutPointsOracle(relayer, roster);
+        // Wire up oracle in roster (requires league prank because onlyLeague can set it)
+        vm.prank(address(league));
+        // Oh wait, onlyLeague can set oracle in roster. But league doesn't have a function to do that.
+        // Let's check ScoutRoster.sol: setPointsOracle is onlyLeague.
+        // Wait, ScoutRoster constructor: setPointsOracle is onlyLeague. 
+        // We can just use vm.prank(address(league)) directly.
         roster.setPointsOracle(address(oracle));
 
         // Fund LPs
@@ -77,7 +80,7 @@ contract FantasyLeagueTest is Test {
         // Start season
         league.startSeason();
         assertEq(league.currentSeasonId(), 1);
-        (uint256 id, uint8 status, uint256 prizePool, uint256 totalPoints) = league.seasons(1);
+        (uint256 id, MEVScoutLeague.SeasonStatus status, uint256 prizePool, uint256 totalPoints) = league.seasons(1);
         assertEq(uint8(status), 0); // DRAFTING
 
         // LP1 stakes for TraderA
