@@ -258,13 +258,13 @@ contract MRLVRewardsTest is Test {
         vm.prank(address(hook));
         loyaltyManager.onAddLiquidity(lp1, 1000, bytes32(poolId));
 
-        uint256 block1 = block.number;
+        uint256 firstBlock = loyaltyManager.getUserFirstDepositBlock(lp1, bytes32(poolId));
         vm.roll(block.number + 10);
         
         vm.prank(address(hook));
         loyaltyManager.onAddLiquidity(lp1, 500, bytes32(poolId));
 
-        assertEq(loyaltyManager.getUserFirstDepositBlock(lp1, bytes32(poolId)), block1);
+        assertEq(loyaltyManager.getUserFirstDepositBlock(lp1, bytes32(poolId)), firstBlock);
         assertEq(loyaltyManager.getUserTotalLiquidity(lp1, bytes32(poolId)), 1500);
         assertEq(loyaltyManager.getUserPositionsLength(lp1, bytes32(poolId)), 2);
     }
