@@ -181,7 +181,7 @@ contract RewardVault is ReentrancyGuard {
         emit Claimed(msg.sender, amount);
     }
 
-    /// @notice Applies an exit penalty (50% reduction) to an LP's accrued rewards.
+    /// @notice Applies an exit penalty (50% reduction) to an LP's accrued rewards.  300 MRVL token 5->6->7 days. 150 MRVL. bhale mai 1 day ya 6th day 50% reduction.  
     function applyExitPenalty(address lp, bytes32 poolId) external onlyLoyaltyManager {
         uint256 accrued = claimable[lp];
         if (accrued > 0) {

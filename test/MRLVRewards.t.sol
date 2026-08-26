@@ -250,8 +250,8 @@ contract MRLVRewardsTest is Test {
         vm.prank(address(hook));
         loyaltyManager.onAddLiquidity(lp1, 1000, bytes32(poolId));
 
-        assertEq(loyaltyManager.firstDepositBlock(lp1, bytes32(poolId)), block.number);
-        assertEq(loyaltyManager.liquidityAmount(lp1, bytes32(poolId)), 1000);
+        assertEq(loyaltyManager.getUserFirstDepositBlock(lp1, bytes32(poolId)), block.number);
+        assertEq(loyaltyManager.getUserTotalLiquidity(lp1, bytes32(poolId)), 1000);
     }
 
     function test_LoyaltyManager_onAddLiquidity_resetsFirstBlock() public {
@@ -263,8 +263,8 @@ contract MRLVRewardsTest is Test {
         loyaltyManager.onAddLiquidity(lp1, 500, bytes32(poolId));
 
         // Starts/resets that pool's window, so firstDepositBlock updates to block.number
-        assertEq(loyaltyManager.firstDepositBlock(lp1, bytes32(poolId)), block.number);
-        assertEq(loyaltyManager.liquidityAmount(lp1, bytes32(poolId)), 1500);
+        assertEq(loyaltyManager.getUserFirstDepositBlock(lp1, bytes32(poolId)), block.number);
+        assertEq(loyaltyManager.getUserTotalLiquidity(lp1, bytes32(poolId)), 1500);
     }
 
     function test_LoyaltyManager_tierProgressesToSilver() public {
@@ -276,7 +276,7 @@ contract MRLVRewardsTest is Test {
         vm.prank(address(hook));
         loyaltyManager.onAddLiquidity(lp1, 1, bytes32(poolId)); // trigger update (which updates using old timer, then resets)
 
-        assertEq(loyaltyManager.tier(lp1, bytes32(poolId)), 1); // Silver
+        assertEq(loyaltyManager.getUserMaxTier(lp1, bytes32(poolId)), 1); // Silver
     }
 
     function test_LoyaltyManager_tierProgressesToGold() public {
@@ -288,7 +288,7 @@ contract MRLVRewardsTest is Test {
         vm.prank(address(hook));
         loyaltyManager.onAddLiquidity(lp1, 1, bytes32(poolId));
 
-        assertEq(loyaltyManager.tier(lp1, bytes32(poolId)), 2); // Gold
+        assertEq(loyaltyManager.getUserMaxTier(lp1, bytes32(poolId)), 2); // Gold
     }
 
     function test_LoyaltyManager_onRemoveLiquidity_reducesAmount() public {
@@ -301,7 +301,7 @@ contract MRLVRewardsTest is Test {
         vm.prank(address(hook));
         loyaltyManager.onRemoveLiquidity(lp1, 400, bytes32(poolId));
 
-        assertEq(loyaltyManager.liquidityAmount(lp1, bytes32(poolId)), 600);
+        assertEq(loyaltyManager.getUserTotalLiquidity(lp1, bytes32(poolId)), 600);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -515,10 +515,10 @@ contract MRLVRewardsTest is Test {
         loyaltyManager.onAddLiquidity(lp1, 2500, bytes32(poolIdB));
         vm.stopPrank();
 
-        assertEq(loyaltyManager.liquidityAmount(lp1, bytes32(poolId)), 1000);
-        assertEq(loyaltyManager.liquidityAmount(lp1, bytes32(poolIdB)), 2500);
-        assertEq(loyaltyManager.firstDepositBlock(lp1, bytes32(poolId)), block.number);
-        assertEq(loyaltyManager.firstDepositBlock(lp1, bytes32(poolIdB)), block.number);
+        assertEq(loyaltyManager.getUserTotalLiquidity(lp1, bytes32(poolId)), 1000);
+        assertEq(loyaltyManager.getUserTotalLiquidity(lp1, bytes32(poolIdB)), 2500);
+        assertEq(loyaltyManager.getUserFirstDepositBlock(lp1, bytes32(poolId)), block.number);
+        assertEq(loyaltyManager.getUserFirstDepositBlock(lp1, bytes32(poolIdB)), block.number);
     }
 
     /// @notice Verify timer reset on every deposit
@@ -526,12 +526,12 @@ contract MRLVRewardsTest is Test {
         vm.roll(10);
         vm.prank(address(hook));
         loyaltyManager.onAddLiquidity(lp1, 1000, bytes32(poolId));
-        assertEq(loyaltyManager.firstDepositBlock(lp1, bytes32(poolId)), 10);
+        assertEq(loyaltyManager.getUserFirstDepositBlock(lp1, bytes32(poolId)), 10);
 
         vm.roll(25);
         vm.prank(address(hook));
         loyaltyManager.onAddLiquidity(lp1, 500, bytes32(poolId));
-        assertEq(loyaltyManager.firstDepositBlock(lp1, bytes32(poolId)), 25);
+        assertEq(loyaltyManager.getUserFirstDepositBlock(lp1, bytes32(poolId)), 25);
     }
 
     /// @notice Verify early and non-early withdrawals
@@ -579,9 +579,9 @@ contract MRLVRewardsTest is Test {
         vm.roll(block.number + 216005);
         vm.prank(address(hook));
         loyaltyManager.onAddLiquidity(lp1, 10, bytes32(poolId)); // upgrades to Silver, resets window start
-        assertEq(loyaltyManager.tier(lp1, bytes32(poolId)), 1); // Silver
+        assertEq(loyaltyManager.getUserMaxTier(lp1, bytes32(poolId)), 1); // Silver
 
-        uint256 tokenAId = uint256(keccak256(abi.encodePacked(lp1, poolId)));
+        (uint256 tokenAId, , , ) = loyaltyManager.userPositions(lp1, bytes32(poolId), 0);
         assertTrue(loyaltyNFT.exists(tokenAId));
         assertEq(loyaltyNFT.tokenTier(tokenAId), 1);
 
@@ -590,9 +590,9 @@ contract MRLVRewardsTest is Test {
         loyaltyManager.onRemoveLiquidity(lp1, 500, bytes32(poolId));
 
         // Remaining position preserved
-        assertEq(loyaltyManager.liquidityAmount(lp1, bytes32(poolId)), 510);
+        assertEq(loyaltyManager.getUserTotalLiquidity(lp1, bytes32(poolId)), 510);
         // Loyalty tier preserved (Silver)
-        assertEq(loyaltyManager.tier(lp1, bytes32(poolId)), 1);
+        assertEq(loyaltyManager.getUserMaxTier(lp1, bytes32(poolId)), 1);
         assertTrue(loyaltyNFT.exists(tokenAId));
         assertEq(loyaltyNFT.tokenTier(tokenAId), 1);
     }
@@ -602,8 +602,8 @@ contract MRLVRewardsTest is Test {
         vm.prank(address(hook));
         loyaltyManager.onAddLiquidity(lp1, 1000, bytes32(poolId));
 
-        uint256 tokenId = uint256(keccak256(abi.encodePacked(lp1, poolId)));
-        assertTrue(loyaltyNFT.exists(tokenId));
+        (uint256 pId, , , ) = loyaltyManager.userPositions(lp1, bytes32(poolId), 0);
+        assertTrue(loyaltyNFT.exists(pId));
 
         // Complete exit
         vm.roll(block.number + 60000); // Past early withdraw window so we don't trigger penalty (optional)
@@ -611,11 +611,11 @@ contract MRLVRewardsTest is Test {
         loyaltyManager.onRemoveLiquidity(lp1, 1000, bytes32(poolId));
 
         // State reset
-        assertEq(loyaltyManager.liquidityAmount(lp1, bytes32(poolId)), 0);
-        assertEq(loyaltyManager.firstDepositBlock(lp1, bytes32(poolId)), 0);
-        assertEq(loyaltyManager.tier(lp1, bytes32(poolId)), 0);
+        assertEq(loyaltyManager.getUserTotalLiquidity(lp1, bytes32(poolId)), 0);
+        assertEq(loyaltyManager.getUserFirstDepositBlock(lp1, bytes32(poolId)), 0);
+        assertEq(loyaltyManager.getUserMaxTier(lp1, bytes32(poolId)), 0);
         // NFT burned
-        assertFalse(loyaltyNFT.exists(tokenId));
+        assertFalse(loyaltyNFT.exists(pId));
     }
 
     /// @notice Verify invalid over-withdrawal reverts
@@ -642,8 +642,8 @@ contract MRLVRewardsTest is Test {
         loyaltyManager.onAddLiquidity(lp1, 2000, bytes32(poolIdB));
         vm.stopPrank();
 
-        uint256 tokenAId = uint256(keccak256(abi.encodePacked(lp1, poolId)));
-        uint256 tokenBId = uint256(keccak256(abi.encodePacked(lp1, poolIdB)));
+        (uint256 tokenAId, , , ) = loyaltyManager.userPositions(lp1, bytes32(poolId), 0);
+        (uint256 tokenBId, , , ) = loyaltyManager.userPositions(lp1, bytes32(poolIdB), 0);
 
         assertNotEq(tokenAId, tokenBId); // Ensure no collision
 
@@ -653,8 +653,8 @@ contract MRLVRewardsTest is Test {
         loyaltyManager.onAddLiquidity(lp1, 10, bytes32(poolId)); // Upgrade A to Silver
 
         // Pool A is Silver (1), Pool B remains Bronze (0)
-        assertEq(loyaltyManager.tier(lp1, bytes32(poolId)), 1);
-        assertEq(loyaltyManager.tier(lp1, bytes32(poolIdB)), 0);
+        assertEq(loyaltyManager.getUserMaxTier(lp1, bytes32(poolId)), 1);
+        assertEq(loyaltyManager.getUserMaxTier(lp1, bytes32(poolIdB)), 0);
 
         assertEq(loyaltyNFT.tokenTier(tokenAId), 1);
         assertEq(loyaltyNFT.tokenTier(tokenBId), 0);
@@ -664,12 +664,12 @@ contract MRLVRewardsTest is Test {
         loyaltyManager.onRemoveLiquidity(lp1, 1010, bytes32(poolId));
 
         // Pool A reset, Pool B untouched
-        assertEq(loyaltyManager.liquidityAmount(lp1, bytes32(poolId)), 0);
-        assertEq(loyaltyManager.tier(lp1, bytes32(poolId)), 0);
+        assertEq(loyaltyManager.getUserTotalLiquidity(lp1, bytes32(poolId)), 0);
+        assertEq(loyaltyManager.getUserMaxTier(lp1, bytes32(poolId)), 0);
         assertFalse(loyaltyNFT.exists(tokenAId));
 
-        assertEq(loyaltyManager.liquidityAmount(lp1, bytes32(poolIdB)), 2000);
-        assertEq(loyaltyManager.tier(lp1, bytes32(poolIdB)), 0);
+        assertEq(loyaltyManager.getUserTotalLiquidity(lp1, bytes32(poolIdB)), 2000);
+        assertEq(loyaltyManager.getUserMaxTier(lp1, bytes32(poolIdB)), 0);
         assertTrue(loyaltyNFT.exists(tokenBId));
     }
 
